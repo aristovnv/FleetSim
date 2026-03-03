@@ -59,6 +59,7 @@ from core.models import SimConfig
 from config.schemas import (
     load_regions, load_companies, load_ship_types, load_nodes,
     load_edges, load_constraints, load_orderbook,
+    load_vessel_groups, load_vessel_group_members,
     ALL_TEMPLATES,
 )
 from config.portal_schemas import ALL_PORTAL_TEMPLATES
@@ -74,7 +75,9 @@ STATE = {
     "sim_error":    None,
 }
 
-DATA_DIR = None   # set by CLI arg
+DATA_DIR = None        # resolved at startup; can be changed at runtime
+TABLE_SOURCES = {}     # name → "csv:<path>" | "template"  (for UI display)
+
 
 
 # ── Table helpers ─────────────────────────────────────────────────────────────
@@ -92,17 +95,49 @@ def get_df(name) -> pd.DataFrame:
 
 
 # ── Init: load all templates (or CSVs from --data dir) ───────────────────────
-def init_tables():
+def _resolve_data_dir(path: str | None) -> str | None:
+    """Expand ~ and env vars; return None if path is falsy."""
+    if not path:
+        # Auto-discover ./data next to portal.py
+        auto = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        return auto if os.path.isdir(auto) else None
+    return os.path.expandvars(os.path.expanduser(path))
+
+
+def load_one_table(name: str, fn, data_dir: str | None) -> tuple:
+    """Load a single table: CSV if available, else template. Returns (rows, source_str)."""
+    if data_dir:
+        csv_path = os.path.join(data_dir, f"{name}.csv")
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            return df_to_rows(df), f"csv:{csv_path}"
+    return df_to_rows(fn()), "template"
+
+
+def init_tables(data_dir: str | None = None):
+    global DATA_DIR, TABLE_SOURCES
+    if data_dir is not None:
+        DATA_DIR = data_dir
     all_templates = {**ALL_TEMPLATES, **ALL_PORTAL_TEMPLATES}
     for name, fn in all_templates.items():
-        csv_path = os.path.join(DATA_DIR, f"{name}.csv") if DATA_DIR else None
-        if csv_path and os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            print(f"  CSV: {name} ({len(df)} rows)")
-        else:
-            df = fn()
-        STATE["tables"][name] = df_to_rows(df)
-    print(f"  {len(STATE['tables'])} tables loaded")
+        rows, source = load_one_table(name, fn, DATA_DIR)
+        STATE["tables"][name] = rows
+        TABLE_SOURCES[name] = source
+        if source.startswith("csv"):
+            print(f"  CSV  : {name} ({len(rows)} rows)  ← {source[4:]}")
+    print(f"  {len(STATE['tables'])} tables loaded ({sum(1 for s in TABLE_SOURCES.values() if s.startswith('csv'))} from CSV)")
+
+
+def reload_table(name: str) -> str:
+    """Reload a single table from its current source. Returns source string."""
+    all_templates = {**ALL_TEMPLATES, **ALL_PORTAL_TEMPLATES}
+    fn = all_templates.get(name)
+    if fn is None:
+        return "unknown"
+    rows, source = load_one_table(name, fn, DATA_DIR)
+    STATE["tables"][name] = rows
+    TABLE_SOURCES[name] = source
+    return source
 
 
 # ── Derive display maps from config tables ────────────────────────────────────
@@ -130,6 +165,8 @@ def build_node_coords() -> dict:
             "label": r.get("label") or r["node"],
             "color_open":   r.get("color_open")   or "#ffd23f",
             "color_closed": r.get("color_closed") or "#ff3860",
+            "is_gateway":   bool(r.get("is_gateway", False)),
+            "icon_shape":   str(r.get("icon_shape", "circle")),
         }
         for r in get_table("viz_nodes")
         if r.get("node") and str(r.get("enabled", "true")).lower() not in ("false", "0", "")
@@ -266,8 +303,10 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
 
         STATE["sim_progress"] = 20
 
+        vmembers   = load_vessel_group_members(_df("vessel_group_members"))
         runner = SimulationRunner(cfg, regions, companies, ship_types,
-                                  fleet_df, orderbook, nodes, edges, constraints)
+                                  fleet_df, orderbook, nodes, edges, constraints,
+                                  vessel_group_memberships=vmembers)
         df = runner.run()
         STATE["sim_progress"] = 70
 
@@ -282,13 +321,19 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
         route_keys = list(route_index.keys())
         rng = random.Random(int(run_cfg.get("seed", 42)))
 
+        # v3 engine uses vessels_{vessel_id} columns
         type_cols = [c for c in df.columns
-                     if c.startswith("active_") and c != "active_constraints"]
+                     if c.startswith("vessels_")]
+        # Fall back to v2 active_ columns if vessels_ not present
+        if not type_cols:
+            type_cols = [c for c in df.columns
+                         if c.startswith("active_") and c != "active_constraints"]
+        col_prefix = "vessels_" if type_cols and type_cols[0].startswith("vessels_") else "active_"
 
         # Populate initial vessel list
         vessels, vid = [], 0
         for col in type_cols:
-            st = col[len("active_"):]
+            st = col[len(col_prefix):]
             count  = int(df.iloc[0][col])
             group  = type_to_group(st, group_radius)
             owner  = type_to_owner(st, type_owner_map)
@@ -306,7 +351,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
         for _, row in df.iterrows():
             # Sync fleet counts
             for col in type_cols:
-                st = col[len("active_"):]
+                st = col[len(col_prefix):]
                 new_n = int(row[col])
                 cur_n = sum(1 for v in vessels if v["type"] == st and v["status"] == "active")
                 diff  = new_n - cur_n
@@ -352,7 +397,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
         node_names   = list(node_coords.keys())
 
         for _, row in df.iterrows():
-            fleet_bd = {col[len("active_"):]: int(row[col]) for col in type_cols}
+            fleet_bd = {col[len(col_prefix):]: int(row[col]) for col in type_cols}
 
             regions_data = {}
             for rn in region_names:
@@ -455,6 +500,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "no result"}, 404)
         elif path == "/api/export_csv":
             self._export_csv()
+        elif path.startswith("/api/download_table/"):
+            tname = path.split("/api/download_table/", 1)[1]
+            self._download_table(tname)
+        elif path == "/api/data_config":
+            all_templates = {**ALL_TEMPLATES, **ALL_PORTAL_TEMPLATES}
+            self._json({
+                "data_dir": DATA_DIR or "",
+                "tables": [
+                    {
+                        "name":    name,
+                        "source":  TABLE_SOURCES.get(name, "template"),
+                        "rows":    len(STATE["tables"].get(name, [])),
+                        "has_template": name in all_templates,
+                    }
+                    for name in sorted(STATE["tables"].keys())
+                ],
+            })
         else:
             self.send_response(404); self.end_headers()
 
@@ -477,8 +539,72 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"status": "ok", "rows": len(rows)})
             else:
                 self._json({"error": "bad request"}, 400)
+        elif path == "/api/set_data_dir":
+            body = self._body()
+            new_dir = body.get("data_dir", "").strip()
+            resolved = _resolve_data_dir(new_dir or None) if new_dir else None
+            if new_dir and not resolved:
+                self._json({"error": f"Directory not found: {new_dir}"}, 400); return
+            init_tables(data_dir=resolved)
+            self._json({"status": "ok", "data_dir": DATA_DIR or "",
+                        "loaded": len(STATE["tables"])})
+        elif path == "/api/upload_csv":
+            self._upload_csv()
+        elif path == "/api/reset_table":
+            body = self._body()
+            tname = body.get("name", "")
+            src_str = reload_table(tname)
+            self._json({"status": "ok", "source": src_str, "rows": len(STATE["tables"].get(tname, []))})
+        elif path == "/api/save_table_csv":
+            body = self._body()
+            tname = body.get("name", "")
+            if not tname or tname not in STATE["tables"]:
+                self._json({"error": "unknown table"}, 400); return
+            save_dir = DATA_DIR or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+            os.makedirs(save_dir, exist_ok=True)
+            csv_path = os.path.join(save_dir, f"{tname}.csv")
+            df = rows_to_df(STATE["tables"][tname])
+            df.to_csv(csv_path, index=False)
+            TABLE_SOURCES[tname] = f"csv:{csv_path}"
+            self._json({"status": "ok", "path": csv_path})
         else:
             self.send_response(404); self.end_headers()
+
+    def _upload_csv(self):
+        """Multipart CSV upload: ?table=name + file body."""
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(self.path).query)
+        tname = (qs.get("table") or [""])[0]
+        if not tname:
+            self._json({"error": "?table= required"}, 400); return
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            df = pd.read_csv(io.StringIO(raw))
+        except Exception as e:
+            self._json({"error": f"CSV parse error: {e}"}, 400); return
+        rows = df_to_rows(df)
+        STATE["tables"][tname] = rows
+        TABLE_SOURCES[tname] = "upload"
+        # Optionally persist to data dir
+        if DATA_DIR:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            df.to_csv(os.path.join(DATA_DIR, f"{tname}.csv"), index=False)
+            TABLE_SOURCES[tname] = f"csv:{os.path.join(DATA_DIR, tname + '.csv')}"
+        self._json({"status": "ok", "rows": len(rows), "columns": list(df.columns)})
+
+    def _download_table(self, tname: str):
+        rows = STATE["tables"].get(tname)
+        if rows is None:
+            self.send_response(404); self.end_headers(); return
+        df = rows_to_df(rows)
+        body = df.to_csv(index=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv")
+        self.send_header("Content-Disposition", f"attachment; filename={tname}.csv")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _export_csv(self):
         if not STATE["sim_result"]:
@@ -535,6 +661,36 @@ html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(
 #run-prog{display:none;width:100px;height:3px;background:var(--bg4);border-radius:2px;overflow:hidden}
 #run-prog-bar{height:100%;background:var(--cy);width:0;transition:width .3s;border-radius:2px}
 #run-txt{font-family:var(--mono);font-size:.6rem;color:var(--t2)}
+/* SETTINGS TAB */
+#panel-settings{flex-direction:column;padding:16px;gap:14px;overflow-y:auto}
+.st-card{background:var(--bg2);border:1px solid var(--b1);border-radius:4px;padding:14px;max-width:900px}
+.st-card h3{font-family:var(--mono);font-size:.72rem;color:var(--cy);margin-bottom:10px;letter-spacing:.1em}
+.st-card p{font-size:.68rem;color:var(--t2);margin-bottom:10px;line-height:1.6}
+.dir-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.dir-input{flex:1;background:var(--bg3);border:1px solid var(--b1);color:var(--t1);font-family:var(--mono);font-size:.72rem;padding:5px 9px;border-radius:3px;outline:none}
+.dir-input:focus{border-color:var(--cy2)}
+.st-btn{background:var(--bg3);border:1px solid var(--b1);color:var(--t2);font-family:var(--mono);font-size:.62rem;padding:5px 11px;border-radius:3px;cursor:pointer;transition:all .12s;white-space:nowrap}
+.st-btn:hover{border-color:var(--cy2);color:var(--cy)}
+.st-btn.warn{border-color:#5a2010;color:var(--or)}
+.st-btn.warn:hover{border-color:var(--or)}
+.table-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px;margin-top:8px}
+.tbl-card{background:var(--bg3);border:1px solid var(--b1);border-radius:3px;padding:8px 10px}
+.tbl-name{font-family:var(--mono);font-size:.65rem;color:var(--cy);margin-bottom:3px}
+.tbl-src{font-size:.58rem;margin-bottom:6px;font-family:var(--mono)}
+.tbl-src.csv{color:var(--gn)}.tbl-src.template{color:var(--t3)}.tbl-src.upload{color:var(--am)}
+.tbl-rows{font-size:.56rem;color:var(--t3);margin-bottom:5px}
+.tbl-actions{display:flex;gap:4px;flex-wrap:wrap}
+.tbl-btn{font-family:var(--mono);font-size:.55rem;padding:2px 7px;border-radius:2px;cursor:pointer;border:1px solid var(--b1);color:var(--t2);background:transparent;transition:all .1s}
+.tbl-btn:hover{border-color:var(--cy2);color:var(--cy)}
+.tbl-btn.green:hover{border-color:var(--gn);color:var(--gn)}
+.tbl-btn.red:hover{border-color:var(--rd);color:var(--rd)}
+.upload-zone{border:1px dashed var(--b2);border-radius:3px;padding:8px 12px;text-align:center;font-size:.62rem;color:var(--t3);cursor:pointer;margin-top:6px;transition:all .12s}
+.upload-zone:hover{border-color:var(--cy2);color:var(--t2)}
+.kv-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.kv-row{display:contents}
+.kv-key{font-family:var(--mono);font-size:.62rem;color:var(--t2);padding:4px 6px;background:var(--bg3);border-radius:2px;align-self:center}
+.kv-val{background:var(--bg3);border:1px solid var(--b1);color:var(--t1);font-family:var(--mono);font-size:.65rem;padding:3px 7px;border-radius:2px;outline:none}
+.kv-val:focus{border-color:var(--cy2)}
 /* panels */
 #content{flex:1;overflow:hidden;position:relative}
 .panel{position:absolute;inset:0;display:none;overflow:auto}.panel.active{display:flex}
@@ -639,6 +795,20 @@ canvas.ch{width:100%;display:block}
 /* toast */
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--b2);color:var(--t1);font-family:var(--mono);font-size:.66rem;padding:6px 16px;border-radius:3px;z-index:9999;opacity:0;transition:opacity .25s;pointer-events:none}
 #toast.show{opacity:1}
+
+/* Pinned region popup panels */
+.rpin{position:absolute;background:rgba(5,12,24,.97);border:1px solid var(--cy2);border-radius:5px;min-width:200px;max-width:260px;box-shadow:0 4px 24px rgba(0,229,255,.18);cursor:default;backdrop-filter:blur(10px)}
+.rpin-hdr{display:flex;align-items:center;gap:6px;padding:7px 10px;border-bottom:1px solid var(--b1);cursor:move;user-select:none}
+.rpin-title{font-family:var(--mono);font-size:.72rem;color:var(--cy);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rpin-sub{font-family:var(--mono);font-size:.55rem;color:var(--t3)}
+.rpin-x{background:none;border:none;color:var(--t3);cursor:pointer;font-size:.8rem;padding:0 2px;line-height:1;flex-shrink:0;transition:color .1s}
+.rpin-x:hover{color:var(--rd)}
+.rpin-body{padding:7px 10px 4px}
+.rprow{display:flex;justify-content:space-between;gap:8px;margin-bottom:3px;font-size:.65rem}
+.rpk{color:var(--t2)}
+.rpv{font-family:var(--mono);color:var(--t1)}
+.rpin-spark{width:100%;display:block;border-top:1px solid var(--b1);padding:4px 0}
+
 ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:2px}
 </style>
 </head>
@@ -652,11 +822,12 @@ canvas.ch{width:100%;display:block}
       <div class="tab" data-tab="dash">📊 DASHBOARD</div>
       <div class="tab" data-tab="scenario">🎯 SCENARIO</div>
       <div class="tab" data-tab="export">💾 EXPORT</div>
+      <div class="tab" data-tab="settings">⚙ SETTINGS</div>
     </div>
     <div id="run-area">
       <span id="run-txt">no result yet</span>
       <div id="run-prog"><div id="run-prog-bar"></div></div>
-      <button id="run-btn" onclick="startRun()">▶ RUN</button>
+      <button id="run-btn" onclick="startRun()">INIT</button>
     </div>
   </div>
 
@@ -741,6 +912,7 @@ canvas.ch{width:100%;display:block}
     </div>
 
     <!-- EXPORT TAB -->
+    <div class="panel" id="panel-settings"></div>
     <div class="panel" id="panel-export">
       <div class="xc"><h3>📄 Results CSV</h3><p>All time steps, market metrics, fleet counts, regional stats.</p>
         <button class="xb" onclick="window.location='/api/export_csv'">⬇ Download CSV</button></div>
@@ -784,6 +956,7 @@ document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   document.getElementById('panel-'+t.dataset.tab).classList.add('active');
   if(t.dataset.tab==='dash'&&SIM) buildDashboard();
   if(t.dataset.tab==='export'&&SIM) buildExportSummary();
+  if(t.dataset.tab==='settings') renderSettings();
 }));
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -797,7 +970,7 @@ async function init(){
     initMap();
     const st=await fetch('/api/status').then(r=>r.json());
     if(st.has_result){SIM=await fetch('/api/result').then(r=>r.json());onSimLoaded();}
-    toast('Ready — press ▶ RUN to simulate');
+    toast('Ready — press INIT to build simulation frames');
   }catch(e){toast('Server error: '+e.message,5000);console.error(e);}
 }
 
@@ -835,7 +1008,7 @@ function onSimLoaded(){
   $('scrubber').max=SIM.steps.length-1;
   initMapLayers();render(0);
   const s=uiSettings();
-  if(s.autoplay_on_load!=='false')setTimeout(()=>setPlay(true),500);
+  // autoplay disabled — use Play button
   if(document.querySelector('#panel-dash.active'))buildDashboard();
 }
 
@@ -866,23 +1039,34 @@ function initMapLayers(){
   // Node pins (config from viz_nodes table via SIM.nodes)
   if(s.show_node_pins!=='false')
     Object.entries(SIM.nodes).forEach(([name,c])=>{
+      const gateLbl = (c.is_gateway?'⬦ ':'◦ ') + (c.label||name);
       nmarks[name]=L.marker([c.lat,c.lon],{icon:nodeIcon(c,true)})
-        .bindTooltip(c.label||name).addTo(lmap);
+        .bindTooltip(gateLbl,{className:'leaflet-tooltip',sticky:false})
+        .addTo(lmap);
     });
-  // Region pins (config from viz_regions table via SIM.regions)
+  // Region pins: hover for tooltip, click to pin popup panel
   if(s.show_region_pins!=='false')
     Object.entries(SIM.regions).forEach(([name,c])=>{
       const m=L.marker([c.lat,c.lon],{icon:regionIcon(name,SIM.steps[0],c)}).addTo(lmap);
-      m.on('mouseover',e=>showPop(name,e,c));
-      m.on('mouseout',()=>$('rpop').style.display='none');
+      m.on('mouseover',e=>showHoverTip(name,e,c));
+      m.on('mouseout',()=>{$('rpop').style.display='none'});
+      m.on('click',e=>pinRegionPanel(name,c));
       rmarks[name]=m;
     });
 }
 
 function nodeIcon(c,open){
   const col=open?(c.color_open||'#ffd23f'):(c.color_closed||'#ff3860');
-  return L.divIcon({className:'',iconSize:[10,10],iconAnchor:[5,5],
-    html:`<div style="width:10px;height:10px;border-radius:50%;border:2px solid ${col};background:${col}22;box-shadow:0 0 8px ${col}88"></div>`});
+  const isGate=c.is_gateway||c.icon_shape==='diamond';
+  if(isGate){
+    // Diamond shape for gateways — rotate a square 45deg
+    const sz=open?14:12; const shadow=open?`0 0 10px ${col}99`:`0 0 6px ${col}`;
+    return L.divIcon({className:'',iconSize:[sz,sz],iconAnchor:[sz/2,sz/2],
+      html:`<div style="width:${sz}px;height:${sz}px;transform:rotate(45deg);border:2px solid ${col};background:${col}${open?'22':'55'};box-shadow:${shadow}"></div>`});
+  }
+  // Circle for secondary chokepoints
+  return L.divIcon({className:'',iconSize:[9,9],iconAnchor:[4,4],
+    html:`<div style="width:9px;height:9px;border-radius:50%;border:1.5px solid ${col};background:${col}18;box-shadow:0 0 5px ${col}66"></div>`});
 }
 
 function regionIcon(name,sd,coords){
@@ -899,7 +1083,7 @@ function regionIcon(name,sd,coords){
     </div>`});
 }
 
-function showPop(name,e,coords){
+function showHoverTip(name,e,coords){
   if(!SIM)return;
   const rd=(SIM.steps[step].regions||{})[name]||{};
   const fields=(coords.popup_fields||'supply,demand,storage').split(',');
@@ -942,7 +1126,7 @@ function render(s){
     m.setIcon(nodeIcon(nc,open));
   });
   Object.entries(rmarks).forEach(([name,m])=>m.setIcon(regionIcon(name,sd,SIM.regions[name]||{})));
-  updateFleet(sd);updateSD(sd);updateSpark(step);
+  updateFleet(sd);updateSD(sd);updateSpark(step);updateAllPinnedPanels();
 }
 
 function updateVessels(s){
@@ -1278,6 +1462,273 @@ function buildExportSummary(){
 }
 
 window.addEventListener('resize',()=>{if(SIM&&document.querySelector('#panel-dash.active'))buildDashboard();});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SETTINGS TAB
+// ═══════════════════════════════════════════════════════════════════════════
+let dataCfg=null;
+
+async function renderSettings(){
+  const panel=document.getElementById('panel-settings');
+  panel.innerHTML='<div style="padding:20px;font-family:var(--mono);font-size:.7rem;color:var(--t2)">Loading…</div>';
+  try{ dataCfg=await fetch('/api/data_config').then(r=>r.json()); }
+  catch(e){ panel.innerHTML='<div style="padding:20px;color:var(--rd)">Error: '+e.message+'</div>'; return; }
+
+  panel.innerHTML=`
+    <div class="st-card">
+      <h3>📁 DATA DIRECTORY</h3>
+      <p>CSV files in this folder override built-in templates. Leave blank to auto-discover <code style="color:var(--cy)">./data/</code> next to portal.py. Apply reloads all tables.</p>
+      <div class="dir-row">
+        <input class="dir-input" id="dir-input" placeholder="/path/to/your/data  or  ./data" value="${dataCfg.data_dir||''}">
+        <button class="st-btn" onclick="applyDataDir()">Apply &amp; Reload All</button>
+        <button class="st-btn" onclick="exportAllCSV()">⬇ Export all CSVs</button>
+      </div>
+      <div id="dir-status" style="font-family:var(--mono);font-size:.6rem;color:var(--t3)">
+        ${dataCfg.data_dir?'✓ Using: '+dataCfg.data_dir:'Using built-in templates — no data dir configured'}
+      </div>
+    </div>
+    <div class="st-card">
+      <h3>📊 TABLE SOURCES  <span style="color:var(--t3);font-size:.62rem">${dataCfg.tables.length} tables</span></h3>
+      <p>Download any table as CSV, upload your own CSV to replace it, save the current in-browser edits to a file, or reset to the built-in template.</p>
+      <div style="margin-bottom:8px;font-family:var(--mono);font-size:.58rem">
+        <span style="color:var(--gn)">■</span> from CSV &nbsp; <span style="color:var(--t3)">■</span> built-in template &nbsp; <span style="color:var(--am)">■</span> uploaded
+      </div>
+      <div class="table-grid" id="table-grid"></div>
+    </div>
+    <div class="st-card">
+      <h3>🎨 UI SETTINGS  <span style="color:var(--t3);font-size:.62rem">portal_settings table</span></h3>
+      <p>These control map center, animation speed, accent colour etc. Saved to the portal_settings table and take effect on next reload.</p>
+      <div class="kv-grid" id="settings-kv"></div>
+      <button class="st-btn" style="margin-top:10px" onclick="savePortalSettings()">💾 Save</button>
+    </div>`;
+  renderTableGrid(); renderSettingsKV();
+}
+
+function renderTableGrid(){
+  if(!dataCfg) return;
+  const grid=document.getElementById('table-grid');
+  if(!grid) return;
+  grid.innerHTML=dataCfg.tables.map(t=>{
+    const st=t.source.startsWith('csv')?'csv':t.source==='upload'?'upload':'template';
+    const sl=st==='csv'?'📄 '+t.source.replace('csv:',''):st==='upload'?'⬆ uploaded this session':'⬡ built-in template';
+    return `<div class="tbl-card" id="tc-${t.name}">
+      <div class="tbl-name">${t.name}</div>
+      <div class="tbl-src ${st}">${sl}</div>
+      <div class="tbl-rows">${t.rows} rows</div>
+      <div class="tbl-actions">
+        <button class="tbl-btn" onclick="downloadTable('${t.name}')">⬇ CSV</button>
+        <button class="tbl-btn" onclick="uploadTable('${t.name}')">⬆ Upload</button>
+        <button class="tbl-btn" onclick="saveTableToFile('${t.name}')">💾 Save to file</button>
+        ${t.has_template?`<button class="tbl-btn red" onclick="resetTable('${t.name}')">↺ Reset</button>`:''}
+      </div>
+      <div class="upload-zone" onclick="triggerUpload('${t.name}')"
+           ondragover="event.preventDefault()" ondrop="handleDrop(event,'${t.name}')">
+        drop CSV here or click
+      </div>
+      <input type="file" accept=".csv" style="display:none" id="fi-${t.name}" onchange="handleFileInput(this,'${t.name}')">
+    </div>`;
+  }).join('');
+}
+
+function renderSettingsKV(){
+  const rows=tables.portal_settings||[];
+  const kv=document.getElementById('settings-kv');
+  if(!kv) return;
+  kv.innerHTML=rows.map((r,i)=>`
+    <div class="kv-key" title="${r.description||''}">${r.key}<span style="display:block;font-size:.52rem;color:var(--t3)">${r.group||''}</span></div>
+    <input class="kv-val" id="kv-${i}" value="${r.value!=null?r.value:''}" placeholder="${r.description||''}">
+  `).join('');
+}
+
+async function savePortalSettings(){
+  const rows=tables.portal_settings||[];
+  rows.forEach((r,i)=>{const el=document.getElementById('kv-'+i);if(el)r.value=el.value;});
+  tables.portal_settings=rows;
+  await fetch('/api/table',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'portal_settings',rows})});
+  toast('✓ UI settings saved');
+}
+
+async function applyDataDir(){
+  const val=document.getElementById('dir-input').value.trim();
+  const ds=document.getElementById('dir-status');
+  ds.textContent='Applying…'; ds.style.color='var(--t3)';
+  const r=await fetch('/api/set_data_dir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data_dir:val})}).then(r=>r.json()).catch(e=>({error:e.message}));
+  if(r.error){ds.textContent='✗ '+r.error;ds.style.color='var(--rd)';return;}
+  tables=await fetch('/api/tables').then(r=>r.json());
+  dataCfg=await fetch('/api/data_config').then(r=>r.json());
+  ds.textContent='✓ Loaded '+r.loaded+' tables from: '+(r.data_dir||'built-in templates');
+  ds.style.color='var(--gn)';
+  renderTableGrid(); buildConfigNav();
+  toast('✓ '+r.loaded+' tables reloaded');
+}
+
+function downloadTable(name){window.location.href='/api/download_table/'+name;}
+
+async function saveTableToFile(name){
+  const r=await fetch('/api/save_table_csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}).then(r=>r.json());
+  if(r.error){toast('✗ '+r.error);return;}
+  toast('✓ Saved → '+r.path);
+  dataCfg=await fetch('/api/data_config').then(r=>r.json());
+  renderTableGrid();
+}
+
+async function resetTable(name){
+  if(!confirm('Reset "'+name+'" to built-in template? Unsaved changes lost.'))return;
+  const r=await fetch('/api/reset_table',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}).then(r=>r.json());
+  tables=await fetch('/api/tables').then(r=>r.json());
+  dataCfg=await fetch('/api/data_config').then(r=>r.json());
+  renderTableGrid();
+  toast('↺ '+name+' reset ('+r.rows+' rows)');
+}
+
+function uploadTable(name){document.getElementById('fi-'+name)?.click();}
+function triggerUpload(name){document.getElementById('fi-'+name)?.click();}
+
+function handleFileInput(input,name){
+  const f=input.files[0]; if(!f)return;
+  uploadCSVFile(name,f); input.value='';
+}
+function handleDrop(e,name){
+  e.preventDefault(); const f=e.dataTransfer.files[0]; if(f)uploadCSVFile(name,f);
+}
+
+async function uploadCSVFile(name,file){
+  const text=await file.text();
+  try{
+    const r=await fetch('/api/upload_csv?table='+encodeURIComponent(name),{
+      method:'POST',headers:{'Content-Type':'text/plain'},body:text
+    }).then(r=>r.json());
+    if(r.error){toast('✗ '+r.error);return;}
+    tables=await fetch('/api/tables').then(r=>r.json());
+    dataCfg=await fetch('/api/data_config').then(r=>r.json());
+    renderTableGrid(); buildConfigNav();
+    toast('✓ '+name+': '+r.rows+' rows loaded from file');
+  }catch(e){toast('✗ Upload failed: '+e.message);}
+}
+
+async function exportAllCSV(){
+  const names=(dataCfg?.tables||[]).map(t=>t.name);
+  for(const n of names){
+    const a=document.createElement('a');a.href='/api/download_table/'+n;a.download=n+'.csv';a.click();
+    await new Promise(r=>setTimeout(r,200));
+  }
+  toast('⬇ Downloading '+names.length+' CSV files…');
+}
+
+
+// ── Pinned region popup panels ────────────────────────────────────────────
+const pinnedPanels = {};
+
+function pinRegionPanel(name, coords) {
+  if (pinnedPanels[name]) {
+    // Already open — bring to front
+    pinnedPanels[name].style.zIndex = nextZ();
+    return;
+  }
+  if (!SIM) return;
+  const el = document.createElement('div');
+  el.className = 'rpin';
+  el.id = 'rpin-'+name;
+  el.style.cssText = `position:absolute;z-index:${nextZ()};left:${80+Object.keys(pinnedPanels).length*24}px;top:${60+Object.keys(pinnedPanels).length*24}px`;
+  el.innerHTML = buildPinContent(name, coords, SIM.steps[step]);
+  // Make draggable
+  makeDraggable(el);
+  $('map').parentElement.style.position='relative';
+  $('map').parentElement.appendChild(el);
+  pinnedPanels[name] = el;
+  updatePinnedPanel(name);
+}
+
+let _zCounter = 2100;
+function nextZ(){ return ++_zCounter; }
+
+function buildPinContent(name, coords, sd) {
+  const rd = (sd.regions||{})[name]||{};
+  const fields = (coords.popup_fields||'supply,demand,storage').split(',');
+  const dsRatio = rd.supply>0 ? (rd.demand/rd.supply).toFixed(3) : '—';
+  const bal = rd.supply - rd.demand;
+  const balCol = bal>=0?'#39ff14':'#ff3860';
+  const rows = fields.map(f=>
+    `<div class="rprow"><span class="rpk">${f}</span><span class="rpv">${(rd[f]||0).toFixed(2)} MMT</span></div>`
+  ).join('');
+  return `
+    <div class="rpin-hdr">
+      <span class="rpin-title">${coords.label||name}</span>
+      <span class="rpin-sub">${name}</span>
+      <button class="rpin-x" onclick="closePin('${name}')">✕</button>
+    </div>
+    <div class="rpin-body" id="rpinb-${name}">
+      ${rows}
+      <div class="rprow"><span class="rpk">D/S ratio</span><span class="rpv">${dsRatio}</span></div>
+      <div class="rprow"><span class="rpk">Balance</span><span class="rpv" style="color:${balCol}">${bal>=0?'+':''}${bal.toFixed(2)} MMT</span></div>
+    </div>
+    <canvas class="rpin-spark" id="rpinspark-${name}" height="40"></canvas>`;
+}
+
+function updatePinnedPanel(name) {
+  if (!SIM || !pinnedPanels[name]) return;
+  const coords = SIM.regions[name]; if(!coords) return;
+  const sd = SIM.steps[step];
+  const rd = (sd.regions||{})[name]||{};
+  const fields = (coords.popup_fields||'supply,demand,storage').split(',');
+  const dsRatio = rd.supply>0 ? (rd.demand/rd.supply).toFixed(3) : '—';
+  const bal = rd.supply - rd.demand;
+  const balCol = bal>=0?'#39ff14':'#ff3860';
+  const rows = fields.map(f=>
+    `<div class="rprow"><span class="rpk">${f}</span><span class="rpv">${(rd[f]||0).toFixed(2)} MMT</span></div>`
+  ).join('');
+  const bodyEl = document.getElementById('rpinb-'+name);
+  if(bodyEl) bodyEl.innerHTML = rows +
+    `<div class="rprow"><span class="rpk">D/S ratio</span><span class="rpv">${dsRatio}</span></div>
+     <div class="rprow"><span class="rpk">Balance</span><span class="rpv" style="color:${balCol}">${bal>=0?'+':''}${bal.toFixed(2)} MMT</span></div>`;
+  // Spark — supply history for this region
+  const cvs = document.getElementById('rpinspark-'+name);
+  if(cvs) {
+    const ctx=cvs.getContext('2d'), dpr=devicePixelRatio||1;
+    cvs.width=cvs.offsetWidth*dpr; cvs.height=40*dpr; ctx.scale(dpr,dpr);
+    const W=cvs.offsetWidth, H=40;
+    const vals = SIM.steps.slice(0,step+1).map(s=>(s.regions||{})[name]?.supply||0);
+    const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||1;
+    ctx.clearRect(0,0,W,H);
+    // Supply line (green)
+    ctx.strokeStyle='#39ff14'; ctx.lineWidth=1.2; ctx.beginPath();
+    vals.forEach((v,i)=>{const x=(i/(vals.length-1||1))*W,y=H-((v-mn)/rng)*(H-4)-2;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+    ctx.stroke();
+    // Demand line (amber)
+    const dvals = SIM.steps.slice(0,step+1).map(s=>(s.regions||{})[name]?.demand||0);
+    ctx.strokeStyle='#ffd23f'; ctx.lineWidth=1; ctx.beginPath();
+    dvals.forEach((v,i)=>{const x=(i/(dvals.length-1||1))*W,y=H-((v-mn)/rng)*(H-4)-2;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+    ctx.stroke();
+  }
+}
+
+function updateAllPinnedPanels() {
+  Object.keys(pinnedPanels).forEach(name=>updatePinnedPanel(name));
+}
+
+function closePin(name) {
+  if(pinnedPanels[name]) {
+    pinnedPanels[name].remove();
+    delete pinnedPanels[name];
+  }
+}
+
+function makeDraggable(el) {
+  let ox,oy,mx,my,dragging=false;
+  el.querySelector('.rpin-hdr').addEventListener('mousedown',e=>{
+    if(e.target.classList.contains('rpin-x')) return;
+    dragging=true; ox=el.offsetLeft; oy=el.offsetTop; mx=e.clientX; my=e.clientY;
+    el.style.zIndex=nextZ();
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove',e=>{
+    if(!dragging) return;
+    el.style.left=(ox+e.clientX-mx)+'px';
+    el.style.top=(oy+e.clientY-my)+'px';
+  });
+  document.addEventListener('mouseup',()=>{dragging=false;});
+}
+
 init();
 </script>
 </body></html>"""
@@ -1292,13 +1743,11 @@ def main():
     p.add_argument("--data", default=None,
                    help="CSV override directory. Files named {table}.csv override built-in templates.")
     args = p.parse_args()
-    DATA_DIR = args.data
+    resolved = _resolve_data_dir(args.data)
 
     print(f"\n{'═'*56}\n  ⬡  Maritime Fleet Simulation Portal  v3\n{'═'*56}")
-    if DATA_DIR:
-        print(f"  Data dir: {DATA_DIR}")
     print(f"  Loading tables...")
-    init_tables()
+    init_tables(data_dir=resolved)
     print(f"  http://{args.host}:{args.port}\n{'═'*56}\n")
     HTTPServer((args.host, args.port), Handler).serve_forever()
 

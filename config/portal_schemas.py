@@ -97,19 +97,26 @@ def template_viz_regions() -> pd.DataFrame:
 # The 'node' name must match exactly the node names in the nodes table.
 # ─────────────────────────────────────────────────────────────────────────────
 def template_viz_nodes() -> pd.DataFrame:
+    """
+    Strategic gateway nodes for map display.
+    is_gateway=True nodes (Gibraltar, Suez, Panama, Malacca/Singapore) trigger
+    routing changes when closed — shown as diamonds on map.
+    """
     return pd.DataFrame([
-        dict(node="Strait of Hormuz",   lat=26.6,  lon= 56.4,
-             label="Hormuz",  color_open="#ffd23f", color_closed="#ff3860", enabled=True),
-        dict(node="Suez Canal",          lat=30.7,  lon= 32.3,
-             label="Suez",    color_open="#ffd23f", color_closed="#ff3860", enabled=True),
-        dict(node="Strait of Malacca",   lat= 3.0,  lon=101.5,
-             label="Malacca", color_open="#ffd23f", color_closed="#ff3860", enabled=True),
-        dict(node="Danish Straits",      lat=57.8,  lon= 10.5,
-             label="Danish",  color_open="#ffd23f", color_closed="#ff3860", enabled=True),
-        dict(node="Panama Canal",        lat= 9.1,  lon=-79.7,
-             label="Panama",  color_open="#ffd23f", color_closed="#ff3860", enabled=True),
-        dict(node="Cape of Good Hope",   lat=-34.4, lon= 18.5,
-             label="Cape",    color_open="#ffd23f", color_closed="#ff3860", enabled=True),
+        # ── Primary routing gateways (diamond icons) ──
+        dict(node="Suez Canal",          lat=30.70, lon= 32.30, label="Suez",       color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        dict(node="Strait of Hormuz",    lat=26.60, lon= 56.40, label="Hormuz",     color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        dict(node="Strait of Malacca",   lat= 3.00, lon=101.50, label="Malacca",    color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        dict(node="Gibraltar Strait",    lat=35.98, lon= -5.45, label="Gibraltar",  color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        dict(node="Panama Canal",        lat= 9.10, lon=-79.70, label="Panama",     color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        dict(node="Singapore Strait",    lat= 1.27, lon=103.83, label="Singapore",  color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        dict(node="Bab el-Mandeb",       lat=12.60, lon= 43.40, label="Bab el-M",   color_open="#ffd23f", color_closed="#ff3860", enabled=True,  is_gateway=True,  icon_shape="diamond"),
+        # ── Secondary chokepoints (circle icons) ──
+        dict(node="Danish Straits",      lat=57.80, lon= 10.50, label="Danish",     color_open="#94a3b8", color_closed="#ff3860", enabled=True,  is_gateway=False, icon_shape="circle"),
+        dict(node="Turkish Straits",     lat=41.10, lon= 29.00, label="Bosphorus",  color_open="#94a3b8", color_closed="#ff3860", enabled=True,  is_gateway=False, icon_shape="circle"),
+        dict(node="Cape of Good Hope",   lat=-34.40,lon= 18.50, label="Cape",       color_open="#94a3b8", color_closed="#ff3860", enabled=True,  is_gateway=False, icon_shape="circle"),
+        dict(node="Lombok Strait",       lat=-8.70, lon=115.70, label="Lombok",     color_open="#94a3b8", color_closed="#ff3860", enabled=True,  is_gateway=False, icon_shape="circle"),
+        dict(node="Cape Horn",           lat=-55.90,lon=-67.20, label="C.Horn",     color_open="#94a3b8", color_closed="#ff3860", enabled=True,  is_gateway=False, icon_shape="circle"),
     ])
 
 
@@ -383,7 +390,9 @@ def template_table_registry() -> pd.DataFrame:
         dict(table_name="portal_params",   label="Sim Parameters",  group="Visual",    sort_order=21, enabled=True),
         dict(table_name="dashboard_charts",label="Dashboard Charts",group="Visual",    sort_order=22, enabled=True),
         dict(table_name="portal_settings", label="UI Settings",     group="Visual",    sort_order=23, enabled=True),
-        dict(table_name="table_registry",  label="Table Registry",  group="Visual",    sort_order=24, enabled=True),
+        dict(table_name="vessel_groups",       label="Vessel Groups",     group="Fleet",     sort_order=13, enabled=True),
+        dict(table_name="vessel_group_members", label="Group Members",     group="Fleet",     sort_order=14, enabled=True),
+        dict(table_name="table_registry",       label="Table Registry",    group="Visual",    sort_order=24, enabled=True),
     ])
 
 
