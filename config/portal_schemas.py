@@ -791,6 +791,8 @@ def template_table_registry() -> pd.DataFrame:
         dict(table_name="groups",               label="Groups",              group="Groups",    sort_order=28, enabled=True),
         dict(table_name="group_hierarchy",      label="Group Hierarchy",     group="Groups",    sort_order=29, enabled=True),
         dict(table_name="object_group_map",     label="Object → Groups",     group="Groups",    sort_order=30, enabled=True),
+        # Conflict resolution rules
+        dict(table_name="conflict_rules",       label="Conflict Rules",      group="Rules",     sort_order=31, enabled=True),
         # Visual config
         dict(table_name="viz_companies",         label="Company Colors",      group="Visual",    sort_order=19, enabled=True),
         dict(table_name="viz_ship_groups",       label="Group Sizes",         group="Visual",    sort_order=20, enabled=True),
@@ -1019,6 +1021,87 @@ def template_object_group_map() -> pd.DataFrame:
         dict(object_id="CNOOC",       object_type="company", group_id="company:noc",    notes="Chinese NOC"),
     ])
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# conflict_rules  — configurable resolution priorities for fleet dynamics
+# ─────────────────────────────────────────────────────────────────────────────
+def template_conflict_rules() -> pd.DataFrame:
+    """Named priority rules for conflict resolution in fleet dynamics.
+
+    rule_type values:
+      scrapping          — which vessel groups are scrapped first when rates fall
+      ordering_priority  — which groups get new-build allocation priority
+      storage_preference — which vessel types convert to floating storage first
+      routing_preference — which routes are preferred when alternates exist
+
+    priority_rank: lower number = higher priority (1 = first/most preferred).
+    condition: freeform tag for when rule applies (optional, e.g. 'spot_below_10k').
+    """
+    return pd.DataFrame([
+        # ── Scrapping priority ───────────────────────────────────────────────
+        # Economics-first: oldest / smallest / worst-positioned vessels scrapped
+        # first. No political ordering. Flags do NOT drive scrapping decisions —
+        # that is determined by market economics, age, and trading position.
+        dict(rule_id="scrap_1",  rule_name="Scrap: Overage vessels",
+             rule_type="scrapping", group_id="age:old",         priority_rank=1,
+             condition="always",   enabled=True,
+             description="Vessels >16yr past economic life are first candidates"),
+        dict(rule_id="scrap_2",  rule_name="Scrap: Mid-age under pressure",
+             rule_type="scrapping", group_id="age:mid",         priority_rank=2,
+             condition="always",   enabled=True,
+             description="Mid-age vessels 6-15yr when sustained low rates persist"),
+        dict(rule_id="scrap_3",  rule_name="Scrap: No-scrubber on high fuel",
+             rule_type="scrapping", group_id="scrubber:no",     priority_rank=3,
+             condition="fuel_premium", enabled=True,
+             description="VLSFO-burning vessels scrapped earlier when fuel spread widens"),
+        dict(rule_id="scrap_4",  rule_name="Scrap: Spot-exposed vessels",
+             rule_type="scrapping", group_id="trade:spot",      priority_rank=4,
+             condition="always",   enabled=True,
+             description="Spot-market vessels have no TC backstop; scrapped before contract vessels"),
+        dict(rule_id="scrap_5",  rule_name="Scrap: MR class first",
+             rule_type="scrapping", group_id="class:mr",        priority_rank=5,
+             condition="always",   enabled=True,
+             description="Smaller MR tankers have shorter economic lives"),
+        dict(rule_id="scrap_6",  rule_name="Scrap: Panamax class",
+             rule_type="scrapping", group_id="class:panamax",   priority_rank=6,
+             condition="always",   enabled=True,
+             description="Panamax scrapped before Aframax when both under pressure"),
+        dict(rule_id="scrap_7",  rule_name="Scrap: Aframax class",
+             rule_type="scrapping", group_id="class:aframax",   priority_rank=7,
+             condition="always",   enabled=True,
+             description=""),
+        dict(rule_id="scrap_8",  rule_name="Scrap: Suezmax class",
+             rule_type="scrapping", group_id="class:suezmax",   priority_rank=8,
+             condition="always",   enabled=True,
+             description=""),
+        dict(rule_id="scrap_9",  rule_name="Scrap: VLCC last",
+             rule_type="scrapping", group_id="class:vlcc",      priority_rank=9,
+             condition="always",   enabled=True,
+             description="VLCCs have highest capital value; scrapped last"),
+        # ── Ordering priority ────────────────────────────────────────────────
+        dict(rule_id="order_1", rule_name="Order: NOC captive first",
+             rule_type="ordering_priority", group_id="trade:captive",  priority_rank=1,
+             condition="always",   enabled=True,
+             description="NOC captive fleets order regardless of spot signal"),
+        dict(rule_id="order_2", rule_name="Order: Contract vessels",
+             rule_type="ordering_priority", group_id="trade:contract", priority_rank=2,
+             condition="profit_signal_positive", enabled=True,
+             description="Time-charter operators order when TC rates justify"),
+        dict(rule_id="order_3", rule_name="Order: Spot traders",
+             rule_type="ordering_priority", group_id="trade:spot",     priority_rank=3,
+             condition="profit_signal_high",     enabled=True,
+             description="Spot traders order only on strong profit signals"),
+        # ── Storage conversion priority ──────────────────────────────────────
+        dict(rule_id="stor_1",  rule_name="Storage: VLCC preferred",
+             rule_type="storage_preference", group_id="class:vlcc",   priority_rank=1,
+             condition="oversupply",  enabled=True,
+             description="VLCCs are preferred floating storage due to volume"),
+        dict(rule_id="stor_2",  rule_name="Storage: Suezmax second",
+             rule_type="storage_preference", group_id="class:suezmax",priority_rank=2,
+             condition="oversupply",  enabled=True,
+             description=""),
+    ])
+
 # ALL_PORTAL_TEMPLATES  — registered here, loaded by portal.py
 # ─────────────────────────────────────────────────────────────────────────────
 ALL_PORTAL_TEMPLATES = {
@@ -1035,4 +1118,5 @@ ALL_PORTAL_TEMPLATES = {
     "groups":            template_groups,
     "group_hierarchy":   template_group_hierarchy,
     "object_group_map":  template_object_group_map,
+    "conflict_rules":     template_conflict_rules,
 }

@@ -68,11 +68,16 @@ from core.engine import SimulationRunner
 
 # ── Server state ──────────────────────────────────────────────────────────────
 STATE = {
-    "tables":       {},   # all config tables: sim + portal-visual
-    "sim_result":   None,
-    "sim_running":  False,
-    "sim_progress": 0,
-    "sim_error":    None,
+    "tables":         {},   # all config tables: sim + portal-visual
+    "sim_result":     None,
+    "sim_running":    False,
+    "sim_progress":   0,
+    "sim_error":      None,
+    # ── Branching ────────────────────────────────────────────────────────────
+    "branches":       {},   # branch_id → {name, cfg, result, fork_from, fork_step, created_at, color}
+    "active_branch":  None, # branch_id currently displayed
+    "world_snapshots":{},   # step → deepcopy(WorldState) for the LAST completed main run
+    "branch_running": None, # branch_id currently computing (or None)
 }
 
 DATA_DIR = None        # resolved at startup; can be changed at runtime
@@ -301,13 +306,17 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
         orderbook  = load_orderbook(_df("orderbook"), ship_types)
         fleet_df   = _df("fleet")
 
+        # Wire conflict_rules → scrapping_priority on cfg
+        _apply_conflict_rules(cfg, tables_snap)
+
         STATE["sim_progress"] = 20
 
         vmembers   = load_vessel_group_members(_df("vessel_group_members"))
         runner = SimulationRunner(cfg, regions, companies, ship_types,
                                   fleet_df, orderbook, nodes, edges, constraints,
                                   vessel_group_memberships=vmembers)
-        df = runner.run()
+        df = runner.run_with_snapshots(snapshot_every=1)
+        STATE["world_snapshots"] = runner._world_snapshots
         STATE["sim_progress"] = 70
 
         # Build display maps from config tables (not hardcoded)
@@ -452,7 +461,203 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
         STATE["sim_running"] = False
 
 
-# ── HTTP handler ──────────────────────────────────────────────────────────────
+# ── Conflict rules helper ──────────────────────────────────────────────────────
+
+def _apply_conflict_rules(cfg, tables_snap: dict):
+    """Read conflict_rules table and wire rule types into SimConfig attributes."""
+    rules = tables_snap.get("conflict_rules", [])
+    if not rules:
+        return
+    # Build per-type priority lists sorted by priority_rank
+    by_type: dict = {}
+    for r in rules:
+        rt    = str(r.get("rule_type") or "").strip()
+        gid   = str(r.get("group_id") or "").strip()
+        rank  = int(r.get("priority_rank") or 99)
+        enabled = str(r.get("enabled", "true")).lower() not in ("false", "0", "")
+        if not rt or not gid or not enabled:
+            continue
+        by_type.setdefault(rt, []).append((rank, gid))
+
+    for rt, lst in by_type.items():
+        lst.sort(key=lambda x: x[0])
+        ordered = [g for _, g in lst]
+        if rt == "scrapping":
+            cfg.scrapping_priority = ordered          # type: ignore[attr-defined]
+        elif rt == "ordering_priority":
+            cfg.ordering_group_priority = ordered     # type: ignore[attr-defined]
+        elif rt == "storage_preference":
+            cfg.storage_group_priority = ordered      # type: ignore[attr-defined]
+
+
+# ── Branch simulation task ─────────────────────────────────────────────────────
+
+_BRANCH_COLORS = ["#ff6b35","#ffd23f","#39ff14","#f472b6","#818cf8","#34d399","#fb923c"]
+
+def run_branch_task(branch_id: str, fork_step: int, fork_branch_id: str,
+                    run_cfg: dict, tables_snap: dict):
+    """Fork a simulation from fork_step with new run_cfg overrides.
+    Stores result in STATE['branches'][branch_id].
+    """
+    import traceback, time
+    try:
+        STATE["branch_running"] = branch_id
+        branch = STATE["branches"][branch_id]
+        branch["status"] = "running"
+        branch["progress"] = 5
+
+        # Get the world snapshot at fork_step from the source branch or main run
+        if fork_branch_id and fork_branch_id != "main":
+            src_result = STATE["branches"].get(fork_branch_id, {}).get("result")
+            world_snaps = STATE["branches"].get(fork_branch_id, {}).get("world_snapshots", {})
+        else:
+            src_result = STATE["sim_result"]
+            world_snaps = STATE["world_snapshots"]
+
+        if not world_snaps:
+            branch["status"] = "error"
+            branch["error"] = "No snapshots available — run main simulation first"
+            return
+
+        # Find closest available snapshot at or before fork_step
+        available = sorted(k for k in world_snaps if k <= fork_step)
+        if not available:
+            branch["status"] = "error"
+            branch["error"] = f"No snapshot at or before step {fork_step}"
+            return
+        snap_step = available[-1]
+        snapshot  = world_snaps[snap_step]
+
+        branch["progress"] = 15
+
+        # Build new SimConfig with overrides
+        gran = Granularity(str(run_cfg.get("granularity", "month")))
+        import inspect
+        sig = inspect.signature(SimConfig.__init__)
+        FIELD_MAP = {
+            "n_periods":"n_periods","seed":"random_seed",
+            "base_spot_rate":"base_spot_rate_usd_day","spot_volatility":"spot_rate_volatility",
+            "wti_price":"wti_price_usd_bbl","fuel_vlsfo":"vlsfo_price_usd_t",
+            "fuel_hfo":"hfo_price_usd_t","ordering_sensitivity":"ordering_sensitivity",
+            "scrapping_threshold":"scrapping_threshold_usd_day",
+            "storage_sd_threshold":"storage_conversion_sd_ratio",
+        }
+        sim_kwargs = {}
+        for pk, sf in FIELD_MAP.items():
+            if pk in run_cfg and sf in sig.parameters:
+                try:
+                    v = run_cfg[pk]
+                    sim_kwargs[sf] = float(v) if "." in str(v) else int(v)
+                except (ValueError, TypeError):
+                    pass
+
+        # Ensure n_periods covers the full range
+        if "n_periods" not in sim_kwargs:
+            base_n = (src_result or {}).get("n_periods", 48)
+            sim_kwargs["n_periods"] = int(run_cfg.get("n_periods", base_n))
+
+        cfg = SimConfig(granularity=gran, **sim_kwargs)
+        _apply_conflict_rules(cfg, tables_snap)
+
+        # Rebuild engine objects from tables
+        def _df(name): return rows_to_df(tables_snap.get(name, []))
+        regions    = load_regions(_df("regions"), _df("region_demand"),
+                                  _df("region_supply"), _df("region_storage"),
+                                  _df("port_times"))
+        companies  = load_companies(_df("companies"))
+        ship_types = load_ship_types(_df("ship_types"))
+        nodes      = load_nodes(_df("nodes"))
+        edges      = load_edges(_df("edges"))
+        constraints= load_constraints(_df("constraints"))
+        orderbook  = load_orderbook(_df("orderbook"), ship_types)
+        fleet_df   = _df("fleet")
+        vmembers   = load_vessel_group_members(_df("vessel_group_members"))
+
+        branch["progress"] = 30
+
+        runner = SimulationRunner(cfg, regions, companies, ship_types,
+                                  fleet_df, orderbook, nodes, edges, constraints,
+                                  vessel_group_memberships=vmembers)
+
+        # Merge pre-fork history from the source branch/run
+        pre_fork_steps = []
+        if src_result:
+            pre_fork_steps = [s for s in src_result.get("steps", [])
+                              if int(s.get("step", 0)) < snap_step]
+
+        # Resume from snapshot
+        post_df = runner.resume_from_snapshot(snapshot, cfg, snap_step)
+        branch["progress"] = 80
+
+        # Convert post-fork DataFrame rows to dicts (same as main run_simulation_task)
+        post_steps = _df_to_steps(post_df, runner)
+
+        # Prepend pre-fork history
+        all_steps = pre_fork_steps + post_steps
+
+        # Build a minimal sim_result compatible with the main display
+        branch["result"] = _clean(dict(
+            steps       = all_steps,
+            routes      = (src_result or {}).get("routes", {}),
+            regions     = (src_result or {}).get("regions", {}),
+            nodes       = (src_result or {}).get("nodes", {}),
+            frames      = (src_result or {}).get("frames", []),  # reuse main frames for vessels
+            n_periods   = cfg.n_periods,
+            fork_step   = fork_step,
+            fork_from   = fork_branch_id,
+        ))
+        branch["world_snapshots"] = runner._world_snapshots if hasattr(runner, "_world_snapshots") else {}
+        branch["status"]   = "done"
+        branch["progress"] = 100
+
+    except Exception as e:
+        import traceback
+        err = str(e) + "\n" + traceback.format_exc()
+        STATE["branches"][branch_id]["status"] = "error"
+        STATE["branches"][branch_id]["error"]  = err
+        print(f"BRANCH ERROR [{branch_id}]:", err[:600])
+    finally:
+        STATE["branch_running"] = None
+
+
+def _df_to_steps(df: "pd.DataFrame", runner) -> list:
+    """Convert a post-fork sim DataFrame back into the steps list format."""
+    if df is None or len(df) == 0:
+        return []
+    steps = []
+    region_names = list(runner.regions.keys())
+    node_names   = list(runner.nodes.keys())
+    for _, row in df.iterrows():
+        regions_data = {}
+        for rn in region_names:
+            regions_data[rn] = {
+                "demand":  round(float(row.get(f"demand_{rn}",  0) or 0), 3),
+                "supply":  round(float(row.get(f"supply_{rn}",  0) or 0), 3),
+                "storage": round(float(row.get(f"storage_inv_{rn}", 0) or 0), 3),
+            }
+        nodes_data = {}
+        for nn in node_names:
+            nk = "node_" + nn.replace(" ", "_").replace(".", "")
+            nodes_data[nn] = bool(int(row.get(nk, 1) or 1))
+
+        steps.append(_clean(dict(
+            step      = int(row.get("step", 0)),
+            date      = str(row.get("date_label", "")),
+            spot_rate = round(float(row.get("spot_rate", 0)), 0),
+            wti       = round(float(row.get("wti_usd_bbl", 0)), 2),
+            vlsfo     = round(float(row.get("vlsfo_usd_t", 0)), 1),
+            hfo       = round(float(row.get("hfo_usd_t",   0)), 1),
+            load_factor=round(float(row.get("load_factor", 0)), 4),
+            fleet_active=int(row.get("fleet_active", 0)),
+            orderbook = int(row.get("orderbook", 0)),
+            sd_ratio  = round(float(row.get("sd_ratio", 1)), 4),
+            regions   = regions_data,
+            nodes     = nodes_data,
+        )))
+    return steps
+
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
@@ -492,12 +697,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json(STATE["tables"])
         elif path == "/api/status":
             self._json(dict(running=STATE["sim_running"], progress=STATE["sim_progress"],
-                            error=STATE["sim_error"], has_result=STATE["sim_result"] is not None))
+                            error=STATE["sim_error"], has_result=STATE["sim_result"] is not None,
+                            active_branch=STATE["active_branch"],
+                            branch_running=STATE["branch_running"]))
         elif path == "/api/result":
-            if STATE["sim_result"]:
+            # Return active branch result if set, otherwise main
+            ab = STATE["active_branch"]
+            if ab and ab in STATE["branches"] and STATE["branches"][ab].get("result"):
+                self._json(STATE["branches"][ab]["result"])
+            elif STATE["sim_result"]:
                 self._json(STATE["sim_result"])
             else:
                 self._json({"error": "no result"}, 404)
+        elif path == "/api/branches":
+            # Summary of all branches (no heavy result payloads)
+            summary = []
+            for bid, b in STATE["branches"].items():
+                summary.append({
+                    "id": bid, "name": b["name"], "status": b["status"],
+                    "fork_from": b["fork_from"], "fork_step": b["fork_step"],
+                    "color": b["color"], "progress": b.get("progress", 0),
+                    "error": b.get("error"),
+                    "created_at": b.get("created_at", 0),
+                })
+            self._json({"branches": summary, "active": STATE["active_branch"]})
         elif path == "/api/export_csv":
             self._export_csv()
         elif path.startswith("/api/download_table/"):
@@ -567,6 +790,56 @@ class Handler(BaseHTTPRequestHandler):
             df.to_csv(csv_path, index=False)
             TABLE_SOURCES[tname] = f"csv:{csv_path}"
             self._json({"status": "ok", "path": csv_path})
+        # ── Branch endpoints ──────────────────────────────────────────────────
+        elif path == "/api/branch/create":
+            body = self._body()
+            if not STATE["sim_result"]:
+                self._json({"error": "Run main simulation first"}, 400); return
+            if STATE["branch_running"]:
+                self._json({"error": "A branch is already running"}, 409); return
+            fork_step      = int(body.get("fork_step", 0))
+            fork_branch_id = str(body.get("fork_branch_id", "main"))
+            override_cfg   = body.get("config", {})
+            branch_name    = str(body.get("name", f"Branch @step{fork_step}"))
+            import time
+            bid = f"b{int(time.time()*1000) % 1_000_000}"
+            color_idx = len(STATE["branches"]) % len(_BRANCH_COLORS)
+            STATE["branches"][bid] = {
+                "id": bid, "name": branch_name, "status": "pending",
+                "fork_from": fork_branch_id, "fork_step": fork_step,
+                "cfg": override_cfg, "color": _BRANCH_COLORS[color_idx],
+                "created_at": int(time.time()), "progress": 0,
+                "result": None, "error": None,
+            }
+            snap = copy.deepcopy(STATE["tables"])
+            cfg  = build_portal_params_defaults()
+            cfg.update(override_cfg)
+            threading.Thread(
+                target=run_branch_task,
+                args=(bid, fork_step, fork_branch_id, cfg, snap),
+                daemon=True).start()
+            self._json({"status": "started", "branch_id": bid})
+        elif path == "/api/branch/activate":
+            body = self._body()
+            bid  = body.get("branch_id")
+            if bid == "main" or bid is None:
+                STATE["active_branch"] = None
+                self._json({"status": "ok", "active": "main"})
+            elif bid in STATE["branches"]:
+                STATE["active_branch"] = bid
+                self._json({"status": "ok", "active": bid})
+            else:
+                self._json({"error": "unknown branch"}, 404)
+        elif path == "/api/branch/delete":
+            body = self._body()
+            bid  = body.get("branch_id")
+            if bid in STATE["branches"]:
+                del STATE["branches"][bid]
+                if STATE["active_branch"] == bid:
+                    STATE["active_branch"] = None
+                self._json({"status": "ok"})
+            else:
+                self._json({"error": "unknown branch"}, 404)
         else:
             self.send_response(404); self.end_headers()
 
@@ -844,6 +1117,12 @@ canvas.ch{width:100%;display:block}
         <span id="spd-ind">1×</span>
         <button class="tb" id="tb-fa">+</button>
         <div id="scrub-wrap"><input type="range" id="scrubber" min="0" value="0"></div>
+        <button class="tb fork-btn" id="tb-fork" onclick="openForkDialog()" title="Fork simulation from current step">⑂ Fork</button>
+        <div id="branch-sel-wrap" style="display:none">
+          <select id="branch-sel" onchange="activateBranch(this.value)" style="background:#142540;color:#00e5ff;border:1px solid #1e3a5f;border-radius:3px;font-size:.6rem;padding:2px 4px;font-family:var(--mono)">
+            <option value="main">● main</option>
+          </select>
+        </div>
         <div class="tg">
           <div class="tk"><span class="tkl">Spot</span><span class="tkv" id="tv-spot">—</span></div>
           <div class="tk"><span class="tkl">WTI</span><span class="tkv" id="tv-wti">—</span></div>
@@ -1731,7 +2010,227 @@ function makeDraggable(el) {
 }
 
 init();
+
+// ── Fork / Branch system ──────────────────────────────────────────────────────
+
+/* CSS injected inline */
+(function(){
+  const s=document.createElement('style');
+  s.textContent=`
+  #fork-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:4000;align-items:center;justify-content:center}
+  #fork-modal.open{display:flex}
+  #fork-box{background:#050c18;border:1px solid #1e3a5f;border-radius:6px;padding:20px 24px;min-width:340px;max-width:480px;font-family:var(--mono);color:var(--t1)}
+  #fork-box h3{margin:0 0 14px;color:#00e5ff;font-size:.85rem;letter-spacing:.05em}
+  .fp{margin-bottom:10px}
+  .fp label{display:block;font-size:.6rem;color:#7a9abb;margin-bottom:3px}
+  .fp input,.fp select{width:100%;background:#0a1628;border:1px solid #1e3a5f;color:var(--t1);
+    border-radius:3px;padding:5px 8px;font-family:var(--mono);font-size:.7rem;box-sizing:border-box}
+  .fp .fp-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #fork-actions{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
+  #fork-actions button{padding:6px 14px;border-radius:3px;font-family:var(--mono);font-size:.68rem;cursor:pointer;border:none}
+  #fork-go{background:#00e5ff;color:#050c18;font-weight:700}
+  #fork-cancel{background:#142540;color:#7a9abb;border:1px solid #1e3a5f}
+  #branch-panel{position:fixed;right:12px;top:50%;transform:translateY(-50%);
+    background:#050c18;border:1px solid #1e3a5f;border-radius:5px;z-index:1200;
+    min-width:200px;max-width:240px;display:none;font-family:var(--mono)}
+  #branch-panel.open{display:block}
+  #branch-panel-hdr{padding:7px 10px;color:#00e5ff;font-size:.65rem;letter-spacing:.05em;
+    border-bottom:1px solid #1e3a5f;display:flex;justify-content:space-between;align-items:center}
+  .br-item{padding:6px 10px;border-bottom:1px solid #0d1f3a;cursor:pointer;transition:background .15s}
+  .br-item:hover{background:#0a1628}
+  .br-item.active{background:#0a1f3a;border-left:3px solid #00e5ff}
+  .br-name{font-size:.65rem;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .br-meta{font-size:.55rem;color:#7a9abb;margin-top:2px}
+  .br-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px;flex-shrink:0}
+  .br-row{display:flex;align-items:center}
+  .br-del{margin-left:auto;padding:1px 5px;background:transparent;border:none;color:#ff3860;
+    cursor:pointer;font-size:.7rem;opacity:.5;transition:opacity .15s}
+  .br-del:hover{opacity:1}
+  .fork-btn{background:#1e3a5f!important;color:#00e5ff!important;font-size:.6rem!important;padding:3px 8px!important}
+  #branch-toggle{padding:3px 8px;background:#1e3a5f;color:#00e5ff;border:1px solid #2a4a7f;
+    border-radius:3px;font-family:var(--mono);font-size:.58rem;cursor:pointer;margin-left:6px}
+  .br-prog{height:2px;background:#142540;margin-top:3px;border-radius:1px;overflow:hidden}
+  .br-prog-fill{height:100%;background:#00e5ff;transition:width .3s}
+  `;
+  document.head.appendChild(s);
+})();
+
+// Fork dialog
+let forkOverrides = {};
+
+function openForkDialog(){
+  if(!SIM){toast('Run simulation first');return;}
+  $('fork-step-val').value = step;
+  $('fork-name').value = 'Branch @step '+step;
+  // Reset overrides
+  ['fork-spot','fork-wti','fork-vlsfo','fork-scrapping'].forEach(id=>{
+    const el=$B(id); if(el) el.value='';
+  });
+  $('fork-modal').classList.add('open');
+}
+function closeForkDialog(){$('fork-modal').classList.remove('open');}
+
+async function submitFork(){
+  const forkStep = parseInt($('fork-step-val').value)||step;
+  const name     = $('fork-name').value || ('Branch @'+forkStep);
+  const cfg = {};
+  const spot = parseFloat($('fork-spot').value);    if(!isNaN(spot))   cfg.base_spot_rate=spot;
+  const wti  = parseFloat($('fork-wti').value);     if(!isNaN(wti))    cfg.wti_price=wti;
+  const vlsfo= parseFloat($('fork-vlsfo').value);   if(!isNaN(vlsfo))  cfg.fuel_vlsfo=vlsfo;
+  const scrap= parseFloat($('fork-scrapping').value);if(!isNaN(scrap)) cfg.scrapping_threshold=scrap;
+  const n    = parseInt($('fork-nperiods').value);   if(!isNaN(n))      cfg.n_periods=n;
+  closeForkDialog();
+  toast('Forking simulation from step '+forkStep+'…');
+  const r = await fetch('/api/branch/create',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fork_step:forkStep, fork_branch_id:'main', name, config:cfg})});
+  const d = await r.json();
+  if(d.error){toast('Fork error: '+d.error);return;}
+  $('branch-sel-wrap').style.display='';
+  $('branch-panel').classList.add('open');
+  pollBranches();
+}
+
+async function activateBranch(bid){
+  await fetch('/api/branch/activate',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({branch_id:bid})});
+  SIM=null; step=0;
+  const r=await fetch('/api/result'); if(!r.ok)return;
+  SIM=await r.json();
+  if(SIM&&SIM.steps){
+    $('scrubber').max=SIM.steps.length-1;
+    renderStep(step);
+    renderInitMap();
+  }
+  toast(bid==='main'?'Showing main run':'Showing '+bid);
+}
+
+async function deleteBranch(bid){
+  if(!confirm('Delete branch '+bid+'?'))return;
+  await fetch('/api/branch/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({branch_id:bid})});
+  refreshBranchPanel();
+  if($('branch-sel').value===bid) activateBranch('main');
+}
+
+let _branchPoll=null;
+function pollBranches(){
+  if(_branchPoll)clearInterval(_branchPoll);
+  _branchPoll=setInterval(async()=>{
+    await refreshBranchPanel();
+    const any=Object.values(await (await fetch('/api/branches')).json().then(d=>d.branches||[])).some(b=>b.status==='running');
+    if(!any){clearInterval(_branchPoll);_branchPoll=null;}
+  },1200);
+}
+
+async function refreshBranchPanel(){
+  const resp=await fetch('/api/branches');
+  const data=await resp.json();
+  const branches=data.branches||[];
+  const active=data.active||'main';
+
+  // Update selector
+  const sel=$('branch-sel');
+  const prevVal=sel.value;
+  sel.innerHTML='<option value="main">● main</option>';
+  branches.forEach(b=>{
+    const o=document.createElement('option');
+    o.value=b.id;
+    o.textContent=(b.status==='running'?'⟳ ':b.status==='error'?'✗ ':'⑂ ')+b.name;
+    sel.appendChild(o);
+  });
+  sel.value=active||'main';
+
+  // Update panel
+  const list=$('branch-list');
+  list.innerHTML='';
+  if(branches.length===0){
+    list.innerHTML='<div style="padding:8px 10px;font-size:.58rem;color:#7a9abb">No branches yet.<br>Click ⑂ Fork to create one.</div>';
+    return;
+  }
+  branches.forEach(b=>{
+    const isActive=(b.id===active);
+    const div=document.createElement('div');
+    div.className='br-item'+(isActive?' active':'');
+    const progHtml=b.status==='running'?
+      `<div class="br-prog"><div class="br-prog-fill" style="width:${b.progress}%"></div></div>`:'';
+    div.innerHTML=`<div class="br-row">
+      <span class="br-dot" style="background:${b.color}"></span>
+      <span class="br-name">${b.name}</span>
+      <button class="br-del" onclick="deleteBranch('${b.id}')" title="Delete">✕</button>
+    </div>
+    <div class="br-meta">⑂ step ${b.fork_step} · ${b.status}${b.status==='running'?' '+b.progress+'%':''}</div>
+    ${progHtml}`;
+    div.onclick=e=>{if(e.target.classList.contains('br-del'))return;activateBranch(b.id);};
+    list.appendChild(div);
+  });
+  if(branches.length>0) $('branch-sel-wrap').style.display='';
+}
+
+function $B(id){return document.getElementById(id);}
+
+// Chart overlay: draw fork marker
+const _origDrawChart=drawChart;
+function drawChart(cfg,steps,canvasId){
+  _origDrawChart(cfg,steps,canvasId);
+  // Draw fork lines for all branches
+  fetch('/api/branches').then(r=>r.json()).then(data=>{
+    const branches=data.branches||[];
+    branches.forEach(b=>{
+      const canvas=$B(canvasId);
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const n=steps.length;
+      if(n<2)return;
+      const x=Math.round((b.fork_step/Math.max(n-1,1))*canvas.width);
+      ctx.save();
+      ctx.strokeStyle=b.color;ctx.lineWidth=1;ctx.setLineDash([3,3]);
+      ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle=b.color;ctx.font='9px monospace';
+      ctx.fillText('⑂',x+2,12);
+      ctx.restore();
+    });
+  }).catch(()=>{});
+}
 </script>
+
+<!-- Fork dialog modal -->
+<div id="fork-modal">
+  <div id="fork-box">
+    <h3>⑂ Fork Simulation</h3>
+    <div class="fp">
+      <label>Branch name</label>
+      <input id="fork-name" type="text" placeholder="Branch @step N">
+    </div>
+    <div class="fp">
+      <label>Fork from step</label>
+      <input id="fork-step-val" type="number" min="0">
+    </div>
+    <div class="fp"><label>Parameter overrides (leave blank to inherit)</label>
+      <div class="fp-row">
+        <div><label>Spot rate ($/day)</label><input id="fork-spot" type="number" placeholder="inherit"></div>
+        <div><label>WTI price ($/bbl)</label><input id="fork-wti" type="number" placeholder="inherit"></div>
+        <div><label>VLSFO ($/t)</label><input id="fork-vlsfo" type="number" placeholder="inherit"></div>
+        <div><label>Scrapping threshold</label><input id="fork-scrapping" type="number" placeholder="inherit"></div>
+        <div><label>n_periods (total)</label><input id="fork-nperiods" type="number" placeholder="inherit"></div>
+      </div>
+    </div>
+    <div id="fork-actions">
+      <button id="fork-cancel" onclick="closeForkDialog()">Cancel</button>
+      <button id="fork-go" onclick="submitFork()">Run Fork →</button>
+    </div>
+  </div>
+</div>
+
+<!-- Branch panel (right side) -->
+<div id="branch-panel">
+  <div id="branch-panel-hdr">
+    <span>⑂ BRANCHES</span>
+    <button onclick="$('branch-panel').classList.remove('open')" style="background:none;border:none;color:#7a9abb;cursor:pointer;font-size:.8rem">✕</button>
+  </div>
+  <div id="branch-list"></div>
+</div>
+
 </body></html>"""
 
 

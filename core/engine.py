@@ -525,11 +525,20 @@ class FleetDynamics:
                             world.fleet_active[vessel_id][owner] = max(0, count - 1)
             return
 
-        # Group-based scrapping priority: shadow → russia → … → korea
-        GROUP_PRIORITY = [
-            'flag:shadow', 'flag:russia', 'flag:other',
-            'flag:china', 'flag:western', 'flag:greece', 'flag:norway',
-        ]
+        # Group-based scrapping priority — reads from config.scrapping_priority.
+        # Default (age-based, economics-driven — no political ordering):
+        #   oldest vessels first, then mid-age, then anything with poor economics.
+        GROUP_PRIORITY = list(getattr(config, 'scrapping_priority', None) or [
+            'age:old',           # past economic life → first candidates
+            'age:mid',           # ageing but mid-life
+            'scrubber:no',       # VLSFO-burning vessels hurt more by high fuel
+            'trade:spot',        # spot market vessels exposed to rate pressure
+            'class:mr',          # smaller vessels scrapped before large
+            'class:panamax',
+            'class:aframax',
+            'class:suezmax',
+            'class:vlcc',        # VLCCs last — high capex, long economic life
+        ])
         n_to_scrap = max(0, int(scrap_pressure / 3_000 * dt_years))
 
         for priority_group in GROUP_PRIORITY:
@@ -764,3 +773,61 @@ class SimulationRunner:
             rec[f"node_{safe_key}"] = int(w.node_open.get(nid, True))
 
         self._history.append(rec)
+
+    # ── Branching / step-by-step API ─────────────────────────────────────────
+
+    def _tick_step(self, step: int) -> tuple:
+        """Execute one simulation step and return (cal_year, cal_month, eff_dwt, lf)."""
+        gran      = self.config.granularity
+        step_days = gran.days
+
+        self.world.current_day         = step * step_days
+        self.world.current_step        = step
+        self.world.current_year_offset = self.world.current_day / 365.0
+        cal_year, cal_month = _day_to_month(
+            self.world.current_day, self.config.start_year, self.config.start_month)
+        self.world.current_month_1 = cal_month
+
+        self._constraint_engine.tick(self.world, self.regions, self.nodes, step)
+        self._oil_market.tick(self.world, gran)
+        self._fleet_dyn.tick_storage_conversion(self.world, self._oil_market, self.config)
+        eff_dwt, lf = self._freight.tick(
+            self.world, self._oil_market, gran, self.config,
+            list(self._constraint_engine._constraints))
+        self._fleet_dyn.tick_ordering(self.world, self.config, gran)
+        self._fleet_dyn.tick_delivery(self.world)
+        self._fleet_dyn.tick_scrapping(self.world, self.config, gran)
+        self._fleet_dyn.tick_age(self.world, gran)
+        return cal_year, cal_month, eff_dwt, lf
+
+    def run_with_snapshots(self, snapshot_every: int = 1) -> pd.DataFrame:
+        """Like run() but stores WorldState deep-copies every N steps.
+        Snapshots available at self._world_snapshots[step].
+        """
+        import copy
+        self._world_snapshots: Dict[int, Any] = {}
+        self._history = []
+
+        for step in range(self.config.n_periods):
+            cal_year, cal_month, eff_dwt, lf = self._tick_step(step)
+            self._record(step, cal_year, cal_month, eff_dwt, lf)
+            if step % snapshot_every == 0:
+                self._world_snapshots[step] = copy.deepcopy(self.world)
+
+        return pd.DataFrame(self._history)
+
+    def resume_from_snapshot(self, snapshot, new_config,
+                             fork_step: int) -> pd.DataFrame:
+        """Resume from a saved WorldState snapshot at fork_step with new_config.
+        Returns only the post-fork history rows (steps fork_step..n_periods).
+        """
+        import copy
+        self.world  = copy.deepcopy(snapshot)
+        self.config = new_config
+        self._history = []
+
+        for step in range(fork_step, new_config.n_periods):
+            cal_year, cal_month, eff_dwt, lf = self._tick_step(step)
+            self._record(step, cal_year, cal_month, eff_dwt, lf)
+
+        return pd.DataFrame(self._history)
