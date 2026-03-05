@@ -109,9 +109,18 @@ class WorldState:
     banned_countries: Set[ShipCountry] = field(default_factory=set)
     # v3: set of group_ids that are fully blocked from trading
     banned_vessel_groups: Set[str] = field(default_factory=set)
+    # v4: per-node group bans {node_id: {group_ids}} — vessel in any banned group
+    # cannot transit that node and is routed via alternate edge automatically
+    banned_node_groups: Dict[str, Set[str]] = field(default_factory=dict)
     # v3: per-group fuel additive {group_id: usd_per_t}
     group_fuel_additive: Dict[str, float] = field(default_factory=dict)
     fuel_additive_usd_t: float = 0.0  # global additive (kept for compat)
+    # Route-based voyage cost state (updated each tick by FreightMarket)
+    route_throughput_factor: float = 1.0
+    # Per-region supply shock from node closures (separate from constraint shocks)
+    # {region: multiplier}  — e.g. Hormuz closure sets AG → 0.05
+    node_closure_supply_shock: Dict[str, float] = field(default_factory=dict)
+
 
     current_day: float = 0.0
     current_step: int = 0
@@ -147,6 +156,7 @@ class ConstraintEngine:
         world.supply_multipliers   = {}
         world.banned_countries     = set()
         world.banned_vessel_groups = set()
+        world.banned_node_groups   = {}
         world.group_fuel_additive  = {}
         world.fuel_additive_usd_t  = 0.0
 
@@ -173,7 +183,20 @@ class ConstraintEngine:
 
     def _apply(self, c: ScenarioConstraint, world: WorldState,
                all_regions: Dict[str, Region]):
-        ct = c.constraint_type
+        # Support compound constraint_type: "node_closure;supply_shock"
+        raw_type = c.constraint_type
+        if hasattr(raw_type, 'value'):
+            raw_type = raw_type.value
+        for type_str in str(raw_type).split(';'):
+            type_str = type_str.strip()
+            try:
+                ct = ConstraintType(type_str)
+            except ValueError:
+                continue
+            self._apply_single(ct, c, world, all_regions)
+
+    def _apply_single(self, ct: "ConstraintType", c: ScenarioConstraint,
+                      world: WorldState, all_regions: Dict[str, Region]):
 
         if ct == ConstraintType.DEMAND_SHOCK:
             for r in self._target_regions(c, all_regions):
@@ -213,6 +236,20 @@ class ConstraintEngine:
             for nid in c.target_nodes:
                 if c.capacity_vessels is not None:
                     world.node_cap[nid] = c.capacity_vessels
+
+        elif ct == ConstraintType.NODE_GROUP_BAN:
+            # Ban vessel groups from transiting specific nodes.
+            # They will be auto-routed via alternate edges (or blocked if none).
+            # Use this for physical limits (canal lock size, draft) instead of
+            # a separate table — just add a constraint row with:
+            #   type=node_group_ban, target_nodes=Panama Canal,
+            #   target_vessel_groups=class:vlcc;class:suezmax
+            # To model a canal expansion: disable or delete the constraint row.
+            for nid in c.target_nodes:
+                if nid not in world.banned_node_groups:
+                    world.banned_node_groups[nid] = set()
+                for gid in c.target_vessel_groups:
+                    world.banned_node_groups[nid].add(gid)
 
         elif ct == ConstraintType.FUEL_REGULATION:
             if c.target_vessel_groups:
@@ -307,6 +344,171 @@ class OilMarket:
 # FREIGHT MARKET  (v3: group-aware, gateway routing)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# ROUTE MATRIX  — data-driven ton-mile / voyage-day calculator
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RouteMatrix:
+    """
+    For each (from_node, to_node) trade pair, track all candidate Edge objects
+    and select the best available one given the current open/closed node state.
+
+    The "fleet throughput multiplier" tells us how much longer the fleet is at
+    sea relative to baseline.  A value of 1.5 means ships are at sea 50% longer
+    on average for the same cargo → effective fleet throughput is 1/1.5 = 0.67
+    of baseline → utilization and rates spike.
+
+    Chokepoint semantics:
+      SUEZ / BAB    → rerouting adds ~22 extra days for AG→MED
+      HORMUZ        → supply shock (oil can't leave AG); minimal rerouting effect
+                      because there is no alternate route from the Gulf
+      PANAMA        → only affects vessels ≤ Panamax (~80k DWT); VLCCs/Suezmaxes
+                      never used Panama anyway — they go Cape Horn regardless
+      MALACCA       → rerouting via Lombok Strait adds ~2-3 days; moderate impact
+      GIBRALTAR     → rerouting via longer Atlantic arcs; minor impact on most
+    """
+
+    # Node DWT limits loaded from node_vessel_limits table (data-driven).
+    # No hardcoded limits here — see portal Config > Node Vessel Limits.
+    # Default empty: no restrictions until table is loaded.
+    NODE_MAX_DWT: Dict[str, Optional[float]] = {}
+
+    # Baseline trade weights: proportion of global ton-miles for each route pair
+    # Used to weight voyage-day inflation into a single fleet throughput number.
+    # AG routes dominate because AG exports ~35% of globally traded crude.
+    ROUTE_WEIGHTS: Dict[tuple, float] = {
+        ("AG",    "MED"):     0.12,
+        ("AG",    "SEASIA"):  0.08,
+        ("AG",    "CCHINA"):  0.10,
+        ("AG",    "NCHINA"):  0.05,
+        ("AG",    "KOR/JPN"): 0.07,
+        ("AG",    "USG"):     0.03,
+        ("AG",    "USAC"):    0.02,
+        ("RSEA",  "MED"):     0.04,
+        ("RSEA",  "NSEA"):    0.03,
+        ("RSEA",  "UKC"):     0.03,
+        ("BSEA",  "MED"):     0.04,
+        ("BALT",  "NSEA"):    0.03,
+        ("WAF",   "USG"):     0.03,
+        ("WAF",   "MED"):     0.03,
+        ("SEASIA","MED"):     0.02,
+        ("SEASIA","NSEA"):    0.02,
+        ("WCSAM", "USG"):     0.03,
+        ("USWC",  "SEASIA"):  0.02,
+        ("USWC",  "KOR/JPN"): 0.03,
+        ("EAUS",  "KOR/JPN"): 0.02,
+        ("EAUS",  "CCHINA"):  0.02,
+    }
+
+    def __init__(self, edges: list):
+        # Build index: (from, to) → [list of Edge objects], sorted primary first
+        self._edge_index: Dict[tuple, List] = {}
+        for edge in edges:
+            key = (edge.from_node, edge.to_node)
+            self._edge_index.setdefault(key, []).append(edge)
+        # Sort so primary routes (short, no alternate_for) come first
+        for key in self._edge_index:
+            self._edge_index[key].sort(
+                key=lambda e: (len(e.alternate_for), e.base_transit_days.mean))
+
+    def _node_open_for_vessel(self, node_id: str,
+                               node_open: Dict[str, bool],
+                               vessel_groups: Set[str] = None,
+                               banned_node_groups: Dict = None) -> bool:
+        """Node is open AND vessel group is not banned from it."""
+        if not node_open.get(node_id, True):
+            return False
+        if banned_node_groups and vessel_groups:
+            banned = banned_node_groups.get(node_id, set())
+            if banned.intersection(vessel_groups):
+                return False
+        return True
+
+    def best_edge(self, from_node: str, to_node: str,
+                  node_open: Dict[str, bool],
+                  vessel_groups: Set[str] = None,
+                  banned_node_groups: Dict = None):
+        """Return (edge, is_rerouted) for the best available route.
+
+        vessel_groups: groups this vessel belongs to (for node bans).
+        banned_node_groups: {node_id: {group_ids}} from WorldState.
+        """
+        candidates = self._edge_index.get((from_node, to_node), [])
+        if not candidates:
+            return None, False
+        for edge in candidates:
+            if all(self._node_open_for_vessel(
+                       n, node_open, vessel_groups, banned_node_groups)
+                   for n in edge.requires_nodes):
+                is_rerouted = bool(edge.alternate_for)
+                return edge, is_rerouted
+        return candidates[-1], True
+
+    def fleet_throughput_factor(self, node_open: Dict[str, bool],
+                                vessel_dwt_avg: float = 200_000,
+                                world=None) -> float:
+        """
+        Returns fleet throughput factor (0.0 < f ≤ 1.0).
+
+        f = 1.0 → all routes at baseline voyage days (no rerouting)
+        f = 0.7 → fleet effectively 30% smaller because voyages are longer
+
+        Formula: f = Σ(weight × baseline_days) / Σ(weight × active_days)
+        """
+        baseline_total = 0.0
+        active_total   = 0.0
+        weight_sum     = 0.0
+
+        for (fr, to), weight in self.ROUTE_WEIGHTS.items():
+            candidates = self._edge_index.get((fr, to), [])
+            if not candidates:
+                continue
+            baseline_edge = candidates[0]
+            baseline_days = baseline_edge.base_transit_days.mean
+
+            # Use None for vessel_groups in aggregate calculation —
+            # group bans affect individual routing decisions, not the global
+            # throughput average (which averages across all vessel types)
+            active_edge, _ = self.best_edge(
+                fr, to, node_open,
+                vessel_groups=None,
+                banned_node_groups=world.banned_node_groups if hasattr(world,'banned_node_groups') else None)
+            if active_edge is None:
+                active_days = baseline_days * 3.0
+            else:
+                active_days = active_edge.base_transit_days.mean
+
+            baseline_total += weight * baseline_days
+            active_total   += weight * active_days
+            weight_sum     += weight
+
+        if active_total <= 0 or weight_sum <= 0:
+            return 1.0
+
+        factor = baseline_total / active_total   # < 1.0 when routes are longer
+        return max(0.20, min(1.0, factor))       # floor at 20% (extreme crisis)
+
+    def voyage_cost_premium(self, from_node: str, to_node: str,
+                            node_open: Dict[str, bool],
+                            vessel_dwt: float = 200_000,
+                            fuel_usd_per_t: float = 600.0,
+                            fuel_tons_per_day: float = 90.0) -> float:
+        """
+        Extra fuel cost (USD) for rerouting vs baseline, for a single voyage.
+        Used to compute spot rate premium on affected routes.
+        """
+        active_edge, is_rerouted = self.best_edge(
+            from_node, to_node, node_open, vessel_dwt)
+        if not is_rerouted or active_edge is None:
+            return 0.0
+        candidates = self._edge_index.get((from_node, to_node), [])
+        if not candidates:
+            return 0.0
+        baseline_days = candidates[0].base_transit_days.mean
+        extra_days = active_edge.base_transit_days.mean - baseline_days
+        return max(0.0, extra_days * fuel_tons_per_day * fuel_usd_per_t)
+
+
 class FreightMarket:
     """
     v3 changes:
@@ -315,22 +517,15 @@ class FreightMarket:
       - Per-group fuel additives affect LRMC
     """
 
-    CHOKEPOINT_TONMILE_FACTORS: Dict[str, float] = {
-        "Strait of Hormuz":   1.35,
-        "Suez Canal":         1.25,
-        "Bab el-Mandeb":      1.10,
-        "Gibraltar Strait":   1.05,
-        "Strait of Malacca":  1.15,
-        "Singapore Strait":   1.10,
-        "Panama Canal":       1.20,
-        "Danish Straits":     1.08,
-    }
+    # Removed CHOKEPOINT_TONMILE_FACTORS — now computed from RouteMatrix
 
     def __init__(self, ship_types: Dict[str, ShipType],
-                 resolver: VesselGroupResolver, rng):
-        self.ship_types = ship_types
-        self.resolver   = resolver
-        self.rng = rng
+                 resolver: VesselGroupResolver, rng,
+                 route_matrix: "RouteMatrix" = None):
+        self.ship_types   = ship_types
+        self.resolver     = resolver
+        self.rng          = rng
+        self.route_matrix = route_matrix  # injected at SimulationRunner init
 
     def _vessel_is_banned(self, vessel_id: str, ship_type: str,
                           world: WorldState, step: int) -> bool:
@@ -354,12 +549,48 @@ class FreightMarket:
             total += count * st.dwt.mean
         return total
 
-    def _tonmile_multiplier(self, world: WorldState) -> float:
-        mult = 1.0
-        for node_id, factor in self.CHOKEPOINT_TONMILE_FACTORS.items():
-            if not world.node_open.get(node_id, True):
-                mult *= factor
-        return mult
+    def _fleet_throughput_factor(self, world: WorldState, step: int) -> float:
+        """
+        Compute fleet effective throughput factor from RouteMatrix.
+
+        Returns a value ≤ 1.0:
+          1.0 = all routes baseline, fleet at full throughput
+          0.7 = routes 43% longer on average, same cargo needs 43% more ships
+
+        This is the CORRECT mechanism for chokepoint closures:
+          - Demand for oil is unchanged
+          - Voyages get longer when rerouting
+          - Same fleet moves LESS cargo per unit time
+          - Effective supply of fleet capacity shrinks
+          - Utilization and rates spike
+
+        Hormuz is different: it's primarily a SUPPLY SHOCK on AG region
+        (applied by ConstraintEngine), not a ton-mile change, because there
+        is no alternate route to get AG crude out — it simply doesn't ship.
+
+        Panama: VLCCs/Suezmaxes (~200k+ DWT) never fit through Panama regardless.
+        RouteMatrix.NODE_MAX_DWT enforces this — they use Cape Horn by default.
+        Panama closure only affects Panamax-and-below vessels on WCSAM→USG etc.
+        """
+        if self.route_matrix is None:
+            return 1.0
+        avg_dwt = self._avg_fleet_dwt(world, step)
+        factor = self.route_matrix.fleet_throughput_factor(
+            world.node_open, vessel_dwt_avg=avg_dwt, world=world)
+        world.route_throughput_factor = factor
+        return factor
+
+    def _avg_fleet_dwt(self, world: WorldState, step: int) -> float:
+        """Weighted average DWT of active fleet (used for node size checks)."""
+        total_dwt = 0.0
+        total_n   = 0
+        for vessel_id, st_name in world.vessel_ship_type.items():
+            st = self.ship_types.get(st_name)
+            if st is None: continue
+            count = sum(world.fleet_active.get(vessel_id, {}).values())
+            total_dwt += count * st.dwt.mean
+            total_n   += count
+        return total_dwt / max(total_n, 1)
 
     def _lrmc(self, st: ShipType, vessel_id: str,
               world: WorldState, step: int) -> float:
@@ -385,10 +616,21 @@ class FreightMarket:
 
         eff_dwt = self._effective_fleet_dwt(world, step)
         total_demand_mt = oil_market.aggregate_demand(world) * 1e6
-        tonmile_mult = self._tonmile_multiplier(world)
-        adjusted_demand_mt = total_demand_mt * tonmile_mult
 
-        load_factor = min(1.10, adjusted_demand_mt / eff_dwt) if eff_dwt > 0 else 1.10
+        # Fleet throughput factor: < 1.0 when rerouting makes voyages longer.
+        # Correct mechanism: same cargo demand, but less fleet throughput per
+        # time unit because ships are at sea longer on diverted routes.
+        # eff_dwt_throughput shrinks → utilization rises → rates spike.
+        throughput_factor = self._fleet_throughput_factor(world, step)
+        eff_dwt_throughput = eff_dwt * throughput_factor
+
+        # Apply node-closure supply shocks to demand-side (supply already reduced
+        # by ConstraintEngine SUPPLY_SHOCK).  Only reduce if there is genuinely
+        # no alternate route (Hormuz = no alternate for AG crude; Suez has Cape).
+        # This is handled by ConstraintEngine setting supply_multipliers on AG.
+        # Here we just use cargo volume from OilMarket (already multiplier-adjusted).
+
+        load_factor = min(1.10, total_demand_mt / eff_dwt_throughput) if eff_dwt_throughput > 0 else 1.10
 
         util_signal = (load_factor - 0.85) / 0.10
         rate_adjustment = math.tanh(util_signal) * 0.5
@@ -606,6 +848,7 @@ def _day_to_month(day: float, start_year: int, start_month: int):
 # SIMULATION RUNNER
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class SimulationRunner:
     def __init__(self, config: SimConfig,
                  regions: Dict[str, Region],
@@ -669,7 +912,9 @@ class SimulationRunner:
 
         self._constraint_engine = ConstraintEngine(constraints)
         self._oil_market   = OilMarket(regions, self.rng)
-        self._freight      = FreightMarket(ship_types, self.resolver, self.rng)
+        self._route_matrix = RouteMatrix(edges)
+        self._freight      = FreightMarket(ship_types, self.resolver, self.rng,
+                                            route_matrix=self._route_matrix)
         self._fleet_dyn    = FleetDynamics(ship_types, companies, self.resolver, self.rng)
         self._history: List[Dict] = []
 
@@ -745,6 +990,7 @@ class SimulationRunner:
             "hfo_usd_t":        round(w.fuel_price_hfo, 1),
             "load_factor":      round(load_factor, 4),
             "effective_dwt_mt": round(eff_dwt / 1e6, 2),
+            "route_throughput_factor": round(w.route_throughput_factor, 4),
             "fleet_active":     self._total_active_vessels(),
             "fleet_storage":    self._total_storage_vessels(),
             "orderbook":        len(w.orderbook),

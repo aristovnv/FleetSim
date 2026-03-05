@@ -432,6 +432,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
                 orderbook     = int(row["orderbook"]),
                 sd_ratio      = round(float(row["sd_ratio"]), 4),
                 load_factor   = round(float(row["load_factor"]), 4),
+                route_throughput = round(float(row.get("route_throughput_factor", 1.0)), 4),
                 constraints   = str(row.get("active_constraints") or ""),
                 fleet         = fleet_bd,
                 regions       = regions_data,
@@ -490,7 +491,8 @@ def _apply_conflict_rules(cfg, tables_snap: dict):
             cfg.storage_group_priority = ordered      # type: ignore[attr-defined]
 
 
-# ── Branch simulation task ─────────────────────────────────────────────────────
+
+
 
 _BRANCH_COLORS = ["#ff6b35","#ffd23f","#39ff14","#f472b6","#818cf8","#34d399","#fb923c"]
 
@@ -1017,6 +1019,10 @@ html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(
 .sg{border-radius:50%;border:1.5px solid var(--t3);flex-shrink:0}
 /* CONFIG */
 #panel-config{flex-direction:row;overflow:hidden}
+#panel-objects{flex-direction:row;overflow:hidden}
+#onav{width:170px;min-width:140px;border-right:1px solid var(--b1);overflow-y:auto;padding:6px 0;flex-shrink:0}
+#obj-main{flex:1;overflow:hidden;display:flex;flex-direction:column}
+#obj-main .ctw{flex:1;overflow:auto}
 #cnav{width:152px;background:var(--bg2);border-right:1px solid var(--b1);flex-shrink:0;overflow-y:auto;padding:6px 0}
 .cng{padding:9px 13px 2px;font-family:var(--mono);font-size:.54rem;color:var(--t3);letter-spacing:.1em;text-transform:uppercase}
 .cni{padding:5px 13px;cursor:pointer;font-size:.68rem;color:var(--t2);border-left:2px solid transparent;transition:all .12s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1092,6 +1098,7 @@ canvas.ch{width:100%;display:block}
     <div id="tabs">
       <div class="tab active" data-tab="map">🗺 MAP</div>
       <div class="tab" data-tab="config">⚙ CONFIG</div>
+      <div class="tab" data-tab="objects">📦 OBJECTS</div>
       <div class="tab" data-tab="dash">📊 DASHBOARD</div>
       <div class="tab" data-tab="scenario">🎯 SCENARIO</div>
       <div class="tab" data-tab="export">💾 EXPORT</div>
@@ -1129,6 +1136,7 @@ canvas.ch{width:100%;display:block}
           <div class="tk"><span class="tkl">VLSFO</span><span class="tkv" id="tv-vlsfo">—</span></div>
           <div class="tk"><span class="tkl">Fleet</span><span class="tkv" id="tv-fleet">—</span></div>
           <div class="tk"><span class="tkl">S/D</span><span class="tkv" id="tv-sd">—</span></div>
+          <div class="tk" title="Fleet throughput factor — drops when rerouting makes voyages longer"><span class="tkl">Routing</span><span class="tkv" id="tv-rt">—</span></div>
         </div>
         <div id="cst-strip"></div>
       </div>
@@ -1157,6 +1165,20 @@ canvas.ch{width:100%;display:block}
           <button id="add-row" onclick="addRow()">+ Add row</button>
         </div>
         <div class="ctw"><table class="ct"><thead id="ct-head"></thead><tbody id="ct-body"></tbody></table></div>
+      </div>
+    </div>
+
+    <!-- OBJECTS TAB -->
+    <div class="panel" id="panel-objects">
+      <div id="onav"></div>
+      <div id="obj-main">
+        <div id="obj-title" style="font-family:var(--mono);font-size:.7rem;color:var(--cy);padding:10px 14px;border-bottom:1px solid var(--b1)">Select an object type →</div>
+        <div id="obj-actions" style="display:none;padding:5px 8px;gap:6px;display:none;align-items:center;border-bottom:1px solid var(--b1)">
+          <button class="ab" onclick="saveObjTable()">💾 Save</button>
+          <button id="add-obj-row" onclick="addObjRow()">+ Add row</button>
+          <span id="obj-count" style="font-size:.58rem;color:var(--t3);margin-left:6px"></span>
+        </div>
+        <div class="ctw"><table class="ct"><thead id="ot-head"></thead><tbody id="ot-body"></tbody></table></div>
       </div>
     </div>
 
@@ -1244,6 +1266,7 @@ async function init(){
     tables=await fetch('/api/tables').then(r=>r.json());
     runCfg=buildRunCfg();
     buildConfigNav();
+    buildObjectsNav();
     buildScenarioParams();
     buildLegend();
     initMap();
@@ -1392,6 +1415,10 @@ function render(s){
   $('tv-vlsfo').textContent='$'+sd.vlsfo.toFixed(0);
   $('tv-fleet').textContent=sd.fleet_active+(sd.fleet_storage>0?'+'+sd.fleet_storage+'⚓':'');
   $('tv-sd').textContent=sd.sd_ratio.toFixed(3);
+  const rt=sd.route_throughput||1;
+  const rtEl=$('tv-rt');
+  rtEl.textContent=(rt*100).toFixed(0)+'%';
+  rtEl.style.color=rt<0.75?'#ff3860':rt<0.9?'#ffd23f':'#39ff14';
   prevSpot=sp;
   // Constraint/node badges
   const csts=(sd.constraints||'').split(';').filter(Boolean);
@@ -1489,6 +1516,122 @@ $('tb-fa').onclick=()=>{spdIdx=Math.min(spdIdx+1,SPDS.length-1);$('spd-ind').tex
 $('tb-sl').onclick=()=>{spdIdx=Math.max(spdIdx-1,0);$('spd-ind').textContent=SPDS[spdIdx]+'×'};
 $('scrubber').oninput=function(){setPlay(false);if(SIM)render(+this.value)};
 
+// ── Objects panel — driven by object_lists + object_fields ──────────────────
+
+let curObjTable = null;
+
+function buildObjectsNav() {
+  const lists = [...(tables.object_lists || [])]
+    .filter(r => String(r.enabled) !== 'false' && String(r.enabled) !== 'False')
+    .sort((a,b) => (+a.sort_order||99) - (+b.sort_order||99));
+
+  // Group by object_type
+  const groups = {};
+  lists.forEach(r => {
+    const g = r.object_type || 'other';
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(r);
+  });
+
+  const nav = $('onav'); nav.innerHTML = '';
+  Object.entries(groups).forEach(([g, items]) => {
+    const gh = document.createElement('div'); gh.className = 'cng';
+    gh.textContent = g.toUpperCase(); nav.appendChild(gh);
+    items.forEach(r => {
+      if (!tables[r.table_name]) return;
+      const el = document.createElement('div'); el.className = 'cni';
+      el.id = 'oni-' + r.table_name;
+      el.textContent = (r.icon || '') + ' ' + (r.label || r.table_name);
+      el.title = r.description || '';
+      el.onclick = () => loadObjectTable(r.table_name, r);
+      nav.appendChild(el);
+    });
+  });
+}
+
+function loadObjectTable(name, meta) {
+  curObjTable = name;
+  document.querySelectorAll('.cni').forEach(x => x.classList.remove('active'));
+  const el = $('oni-' + name); if (el) el.classList.add('active');
+
+  const titleEl = $('obj-title');
+  titleEl.textContent = (meta.icon||'') + ' ' + (meta.label||name);
+  if (meta.description) titleEl.title = meta.description;
+
+  const actEl = $('obj-actions');
+  actEl.style.display = 'flex';
+
+  const rows  = tables[name] || [];
+  const specs = getFieldSpecs(name);
+  const specMap = Object.fromEntries(specs.map(s => [s.field_name, s]));
+
+  let cols;
+  if (specs.length) {
+    const specCols = specs.map(s => s.field_name);
+    const rawCols  = rows.length ? Object.keys(rows[0]) : [];
+    cols = [...specCols, ...rawCols.filter(c => !specCols.includes(c))];
+  } else {
+    cols = rows.length ? Object.keys(rows[0]) : [];
+  }
+
+  $('obj-count').textContent = rows.length + ' rows';
+
+  $('ot-head').innerHTML = '<tr><th style="width:22px"></th>' +
+    cols.map(c => {
+      const s = specMap[c];
+      const lbl = s ? s.field_label : c;
+      const tip = s && s.description ? ` title="${esc(s.description)}"` : '';
+      return `<th${tip}>${lbl}</th>`;
+    }).join('') + '</tr>';
+
+  $('ot-body').innerHTML = rows.map((row, ri) =>
+    `<tr><td><button class="dr" onclick="delObjRow(${ri})">✕</button></td>` +
+    cols.map(c => {
+      const spec = specMap[c] || {field_name:c, field_type:'text', editable:true};
+      return renderCell(spec, row[c], ri, 'obj');
+    }).join('') + '</tr>'
+  ).join('');
+}
+
+function saveObjTable() {
+  if (!curObjTable) return;
+  const rows = [];
+  $('ot-body').querySelectorAll('tr').forEach(tr => {
+    const row = {};
+    tr.querySelectorAll('.oci').forEach(i => {
+      row[i.dataset.col] = i.dataset.bool ? String(i.checked) : i.value;
+    });
+    if (Object.keys(row).length) rows.push(row);
+  });
+  tables[curObjTable] = rows;
+  fetch('/api/table', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: curObjTable, rows})})
+    .then(() => { $('obj-count').textContent = rows.length + ' rows'; toast(`✓ ${curObjTable} saved`); });
+  document.querySelectorAll('.oci.ch').forEach(i => i.classList.remove('ch'));
+}
+
+function addObjRow() {
+  if (!curObjTable) return;
+  const rows = tables[curObjTable] || [];
+  const specs = getFieldSpecs(curObjTable);
+  const blank = specs.length
+    ? Object.fromEntries(specs.map(s => [s.field_name, s.field_type==='bool'?'False':'']))
+    : (rows.length ? Object.fromEntries(Object.keys(rows[0]).map(k=>[k,''])) : {});
+  if (!tables[curObjTable]) tables[curObjTable] = [];
+  tables[curObjTable].push(blank);
+  const meta = (tables.object_lists||[]).find(r=>r.table_name===curObjTable)||{};
+  loadObjectTable(curObjTable, meta);
+  toast('Row added — fill in and Save');
+}
+
+function delObjRow(ri) {
+  if (!curObjTable) return;
+  tables[curObjTable].splice(ri, 1);
+  const meta = (tables.object_lists||[]).find(r=>r.table_name===curObjTable)||{};
+  loadObjectTable(curObjTable, meta);
+  toast('Row deleted — Save to apply');
+}
+
 // ── Config nav — driven by table_registry ─────────────────────────────────────
 function buildConfigNav(){
   const reg=[...(tables.table_registry||[])].filter(r=>String(r.enabled||'true').toLowerCase()!=='false');
@@ -1508,49 +1651,160 @@ function buildConfigNav(){
   });
 }
 
-// ── Config table editor ───────────────────────────────────────────────────────
-function loadTable(name,label){
-  curTable=name;
-  document.querySelectorAll('.cni').forEach(x=>x.classList.remove('active'));
-  const el=$('cni-'+name);if(el)el.classList.add('active');
-  $('cfg-title').textContent=label||name;
-  $('cfg-actions').style.display='flex';
-  const rows=tables[name]||[],cols=rows.length?Object.keys(rows[0]):[];
-  $('ct-head').innerHTML='<tr><th style="width:22px"></th>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
-  $('ct-body').innerHTML=rows.map((row,ri)=>`
-    <tr><td><button class="dr" onclick="delRow(${ri})">✕</button></td>
-    ${cols.map(c=>`<td><input class="ci" value="${esc(row[c]??'')}" data-col="${c}" data-ri="${ri}" oninput="this.classList.add('ch')"></td>`).join('')}
-    </tr>`).join('');
+// ── Config table editor — driven by object_fields metadata ───────────────────
+
+// Build field spec index: {table_name: [{field_name, field_label, field_type, ...}]}
+function getFieldSpecs(tableName) {
+  const specs = (tables.object_fields || [])
+    .filter(f => f.table_name === tableName)
+    .sort((a,b) => (+a.sort_order||99) - (+b.sort_order||99));
+  return specs;
 }
 
-function esc(v){return String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}
+// Get all distinct values for a ref field (group_ref → groups.group_id, etc.)
+function getRefOptions(fieldType) {
+  const MAP = {
+    group_ref:  () => (tables.groups||[]).map(r=>r.group_id).filter(Boolean),
+    node_ref:   () => (tables.nodes||[]).map(r=>r.node_id).filter(Boolean),
+    region_ref: () => (tables.regions||[]).map(r=>r.region).filter(Boolean),
+    vessel_ref: () => (tables.vessel_groups||[]).map(r=>r.group_id).filter(Boolean),
+    multiref:   () => [],  // freetext for multiref
+  };
+  return (MAP[fieldType] || (() => []))();
+}
+
+// Render one cell input based on field spec
+function renderCell(spec, value, ri, cls='c') {
+  const col  = spec.field_name;
+  const ft   = spec.field_type || 'text';
+  const ccls = cls + 'ci';  // 'ci' for config, 'oci' for objects
+  const ch   = `this.classList.add('ch')`;
+  const base = `data-col="${col}" data-ri="${ri}" class="${ccls}"`;
+
+  if (ft === 'bool') {
+    const chk = (String(value).toLowerCase() === 'true' || value === true) ? 'checked' : '';
+    return `<td style="text-align:center"><input type="checkbox" ${base} ${chk}
+      onchange="this.classList.add('ch')" data-bool="1"></td>`;
+  }
+  if (ft === 'number') {
+    const attrs = [
+      spec.min_val !== '' && spec.min_val != null ? `min="${spec.min_val}"` : '',
+      spec.max_val !== '' && spec.max_val != null ? `max="${spec.max_val}"` : '',
+      spec.step    !== '' && spec.step    != null ? `step="${spec.step}"` : '',
+    ].filter(Boolean).join(' ');
+    return `<td><input type="number" ${base} value="${esc(value??'')}" ${attrs} oninput="${ch}" style="width:80px"></td>`;
+  }
+  if (ft === 'select') {
+    const opts = (spec.options || '').split(';').filter(Boolean);
+    const optHtml = opts.map(o =>
+      `<option value="${esc(o)}" ${String(value)===o?'selected':''}>${o}</option>`
+    ).join('');
+    return `<td><select ${base} onchange="${ch}" style="min-width:90px">
+      <option value=""></option>${optHtml}</select></td>`;
+  }
+  if (ft === 'group_ref' || ft === 'node_ref' || ft === 'region_ref' || ft === 'vessel_ref') {
+    const opts = getRefOptions(ft);
+    if (opts.length) {
+      const optHtml = opts.map(o =>
+        `<option value="${esc(o)}" ${String(value)===o?'selected':''}>${o}</option>`
+      ).join('');
+      return `<td><select ${base} onchange="${ch}" style="min-width:100px">
+        <option value=""></option>${optHtml}</select></td>`;
+    }
+  }
+  // text / multiref / unknown
+  const editable = spec.editable !== false && String(spec.editable) !== 'False';
+  const ro = editable ? '' : 'readonly style="opacity:.5"';
+  const title = spec.description ? `title="${esc(spec.description)}"` : '';
+  return `<td><input type="text" ${base} value="${esc(value??'')}" oninput="${ch}" ${ro} ${title} style="min-width:80px"></td>`;
+}
+
+function loadTable(name, label) {
+  curTable = name;
+  document.querySelectorAll('.cni').forEach(x => x.classList.remove('active'));
+  const el = $('cni-' + name); if (el) el.classList.add('active');
+  $('cfg-title').textContent = label || name;
+  $('cfg-actions').style.display = 'flex';
+
+  const rows = tables[name] || [];
+  const specs = getFieldSpecs(name);
+
+  // Determine columns: use spec order if available, else raw keys
+  let cols;
+  if (specs.length) {
+    const specCols = specs.map(s => s.field_name);
+    const rawCols  = rows.length ? Object.keys(rows[0]) : [];
+    // Union: spec cols first, then any extra raw cols not in spec
+    cols = [...specCols, ...rawCols.filter(c => !specCols.includes(c))];
+  } else {
+    cols = rows.length ? Object.keys(rows[0]) : [];
+  }
+
+  const specMap = Object.fromEntries(specs.map(s => [s.field_name, s]));
+
+  // Header: use field_label from spec when available
+  $('ct-head').innerHTML = '<tr><th style="width:22px"></th>' +
+    cols.map(c => {
+      const s = specMap[c];
+      const lbl = s ? s.field_label : c;
+      const tip = s && s.description ? ` title="${esc(s.description)}"` : '';
+      return `<th${tip}>${lbl}</th>`;
+    }).join('') + '</tr>';
+
+  // Body rows
+  $('ct-body').innerHTML = rows.map((row, ri) =>
+    `<tr><td><button class="dr" onclick="delRow(${ri})">✕</button></td>` +
+    cols.map(c => {
+      const spec = specMap[c] || {field_name:c, field_type:'text', editable:true};
+      return renderCell(spec, row[c], ri);
+    }).join('') +
+    '</tr>'
+  ).join('');
+}
+
+function esc(v){return String(v??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}
 
 function saveTable(){
   if(!curTable)return;
   const rows=[];
   $('ct-body').querySelectorAll('tr').forEach(tr=>{
-    const row={};tr.querySelectorAll('input.ci').forEach(i=>row[i.dataset.col]=i.value);
+    const row={};
+    tr.querySelectorAll('.ci').forEach(i=>{
+      // Checkbox: read .checked; others: read .value
+      row[i.dataset.col] = i.dataset.bool ? String(i.checked) : i.value;
+    });
     if(Object.keys(row).length)rows.push(row);
   });
   tables[curTable]=rows;
-  fetch('/api/table',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:curTable,rows})})
+  fetch('/api/table',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:curTable,rows})})
     .then(()=>toast(`✓ ${curTable} saved (${rows.length} rows)`));
   document.querySelectorAll('.ci.ch').forEach(i=>i.classList.remove('ch'));
-  // Rebuild legend if visual table was edited
   if(['viz_companies','viz_ship_groups'].includes(curTable))buildLegend();
 }
 
 function resetTable(){
   if(!curTable)return;
-  fetch('/api/tables').then(r=>r.json()).then(t=>{tables[curTable]=t[curTable];loadTable(curTable);toast(`↺ ${curTable} reset`);});
+  fetch('/api/tables').then(r=>r.json()).then(t=>{
+    tables[curTable]=t[curTable];loadTable(curTable);toast(`↺ ${curTable} reset`);
+  });
 }
 function addRow(){
   if(!curTable)return;
   const rows=tables[curTable]||[];
-  tables[curTable].push(rows.length?Object.fromEntries(Object.keys(rows[0]).map(k=>[k,''])):{});
+  const specs=getFieldSpecs(curTable);
+  let blank;
+  if(specs.length){
+    blank=Object.fromEntries(specs.map(s=>[s.field_name, s.field_type==='bool'?'False':'']));
+  } else {
+    blank=rows.length?Object.fromEntries(Object.keys(rows[0]).map(k=>[k,''])):{};
+  }
+  tables[curTable].push(blank);
   loadTable(curTable);toast('Row added — fill in and Save');
 }
 function delRow(ri){if(!curTable)return;tables[curTable].splice(ri,1);loadTable(curTable);toast('Row deleted — Save to apply');}
+
+
 
 // ── Scenario params — driven by portal_params table ────────────────────────
 function buildScenarioParams(){

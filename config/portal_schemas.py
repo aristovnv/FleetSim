@@ -793,6 +793,7 @@ def template_table_registry() -> pd.DataFrame:
         dict(table_name="object_group_map",     label="Object → Groups",     group="Groups",    sort_order=30, enabled=True),
         # Conflict resolution rules
         dict(table_name="conflict_rules",       label="Conflict Rules",      group="Rules",     sort_order=31, enabled=True),
+        dict(table_name="node_vessel_limits",    label="Node Vessel Limits",  group="Rules",     sort_order=32, enabled=True),
         # Visual config
         dict(table_name="viz_companies",         label="Company Colors",      group="Visual",    sort_order=19, enabled=True),
         dict(table_name="viz_ship_groups",       label="Group Sizes",         group="Visual",    sort_order=20, enabled=True),
@@ -1102,6 +1103,54 @@ def template_conflict_rules() -> pd.DataFrame:
              description=""),
     ])
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# node_vessel_limits  — configurable DWT/size limits per node
+# ─────────────────────────────────────────────────────────────────────────────
+def template_node_vessel_limits() -> pd.DataFrame:
+    """
+    DWT limits per node.  These are PHYSICAL constraints (canal locks, channel
+    depth, bridge clearance) — not political ones.  Political/commercial limits
+    belong in constraints.csv.
+
+    max_dwt_t:      Maximum vessel displacement in tonnes.  Vessels exceeding
+                    this are routed via alternate edges automatically.
+    reason:         Human-readable reason (lock size, channel depth, etc.)
+    source_year:    Year of the specification (update when canal expands/floods)
+    enabled:        Set False to temporarily disable the limit (e.g. model a
+                    canal expansion or a drought scenario via a branch fork).
+
+    Updating this table is the correct way to model:
+      - Panama Canal drought (reduce max_dwt_t, or set enabled=False for large)
+      - Canal expansion (increase max_dwt_t)
+      - New lock construction (add a row)
+      - Turkish Straits seasonal depth limits (branch fork with reduced limit)
+    """
+    return pd.DataFrame([
+        # ── Panama Canal ─────────────────────────────────────────────────────
+        # New Panamax locks (2016) handle up to ~120k DWT Neopanamax.
+        # Old locks ~65k DWT.  Crude tankers rarely use Panama regardless —
+        # VLCCs/Suezmaxes never fit.  Most Panama crude is small product tankers.
+        dict(node_id="Panama Canal", limit_name="Neopanamax lock limit",
+             max_dwt_t=120_000, group_applies_to="class:vlcc,class:suezmax",
+             reason="Lock chamber dimensions: 427m × 55m × 18.3m max draft",
+             source_year=2016, enabled=True),
+
+        # ── Turkish Straits (Bosphorus) ───────────────────────────────────────
+        # 150k DWT max, draft limit 17.5m.  Suezmaxes barely fit; VLCCs cannot.
+        dict(node_id="Turkish Straits", limit_name="Bosphorus draft/beam limit",
+             max_dwt_t=150_000, group_applies_to="class:vlcc",
+             reason="Bosphorus: 17.5m max draft, 45m min width at narrowest point",
+             source_year=2024, enabled=True),
+
+        # ── Danish Straits ────────────────────────────────────────────────────
+        # Great Belt: 68m air draft, 15m water draft.  Limits largest VLCCs.
+        dict(node_id="Danish Straits", limit_name="Great Belt draft limit",
+             max_dwt_t=150_000, group_applies_to="class:vlcc",
+             reason="Great Belt Bridge: 65m air clearance, 15m channel draft limit",
+             source_year=2024, enabled=True),
+    ])
+
 # ALL_PORTAL_TEMPLATES  — registered here, loaded by portal.py
 # ─────────────────────────────────────────────────────────────────────────────
 ALL_PORTAL_TEMPLATES = {
@@ -1119,4 +1168,5 @@ ALL_PORTAL_TEMPLATES = {
     "group_hierarchy":   template_group_hierarchy,
     "object_group_map":  template_object_group_map,
     "conflict_rules":     template_conflict_rules,
+    "node_vessel_limits":  template_node_vessel_limits,
 }

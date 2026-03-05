@@ -107,6 +107,7 @@ class ConstraintType(Enum):
     FUEL_REGULATION         = "fuel_regulation"         # IMO 2020 style
     SPOT_PRICE_SHOCK        = "spot_price_shock"
     NEWBUILD_LIMIT          = "newbuild_limit"          # yards saturated
+    NODE_GROUP_BAN          = "node_group_ban"          # vessel group banned from node (size/physical)
 
 
 class SeasonIndex(Enum):
