@@ -1019,7 +1019,8 @@ function initMap(){
   if(lmap)return;
   const s=uiSettings();
   lmap=L.map('map',{center:[+(s.map_center_lat||20),+(s.map_center_lon||20)],
-    zoom:+(s.map_zoom||2),zoomControl:true,attributionControl:false,minZoom:2,maxZoom:6});
+    zoom:+(s.map_zoom||2),zoomControl:true,attributionControl:false,minZoom:2,maxZoom:6,
+    worldCopyJump:true});
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:6}).addTo(lmap);
   vlayer=L.layerGroup().addTo(lmap);
 }
@@ -1072,15 +1073,15 @@ function nodeIcon(c,open){
 function regionIcon(name,sd,coords){
   const rd=(sd.regions||{})[name]||{};
   const ratio=rd.supply>0?rd.demand/rd.supply:0;
-  const w=Math.min(100,Math.round(ratio*55));
-  const bc=ratio>1.1?'#ff3860':ratio>0.9?'#39ff14':'#ffd23f';
-  const lbl=(coords.label||name).substring(0,11);
-  return L.divIcon({className:'',iconSize:[84,40],iconAnchor:[42,20],
-    html:`<div style="padding:3px 6px;background:rgba(5,12,24,.88);border:1px solid rgba(0,229,255,.3);border-radius:3px;font-family:'Share Tech Mono',monospace;cursor:pointer">
-      <div style="color:#00e5ff;font-size:.58rem;margin-bottom:1px">${lbl}</div>
-      <div style="display:flex;gap:4px;font-size:.52rem;color:#7a9abb"><span>S:${(rd.supply||0).toFixed(1)}</span><span>D:${(rd.demand||0).toFixed(1)}</span></div>
-      <div style="height:2px;background:#142540;margin-top:2px;border-radius:1px;overflow:hidden"><div style="width:${w}%;height:100%;background:${bc}"></div></div>
-    </div>`});
+  // Colour pulse: green=balanced, amber=tight, red=shortage
+  const col=ratio>1.1?'#ff3860':ratio>0.85?'#39ff14':'#ffd23f';
+  const r=6;
+  return L.divIcon({className:'',iconSize:[r*2,r*2],iconAnchor:[r,r],
+    html:`<div title="${coords.label||name}" style="width:${r*2}px;height:${r*2}px;border-radius:50%;
+      border:1.5px solid ${col};background:${col}28;
+      box-shadow:0 0 6px ${col}88;cursor:pointer;transition:box-shadow .2s"
+      onmouseenter="this.style.boxShadow='0 0 12px ${col}'"
+      onmouseleave="this.style.boxShadow='0 0 6px ${col}88'"></div>`});
 }
 
 function showHoverTip(name,e,coords){
