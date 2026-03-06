@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Maritime Fleet Portal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+<div id="shell">
+  <div id="topbar">
+    <div id="logo">⬡ MARITIME SIM <span>v3 · all data-driven</span></div>
+    <div id="tabs">
+      <div class="tab active" data-tab="map">🗺 MAP</div>
+      <div class="tab" data-tab="config">⚙ CONFIG</div>
+      <div class="tab" data-tab="objects">📦 OBJECTS</div>
+      <div class="tab" data-tab="dash">📊 DASHBOARD</div>
+      <div class="tab" data-tab="scenario">🎯 SCENARIO</div>
+      <div class="tab" data-tab="export">💾 EXPORT</div>
+      <div class="tab" data-tab="settings">⚙ SETTINGS</div>
+    </div>
+    <div id="run-area">
+      <span id="run-txt">no result yet</span>
+      <div id="run-prog"><div id="run-prog-bar"></div></div>
+      <button id="run-btn" onclick="startRun()">INIT</button>
+    </div>
+  </div>
+
+  <div id="content">
+    <!-- MAP TAB -->
+    <div class="panel active" id="panel-map">
+      <div id="tbar">
+        <div id="date-bd">----</div><div id="step-bd">—</div>
+        <button class="tb" id="tb-prev">◀</button>
+        <button class="tb" id="tb-play">▶</button>
+        <button class="tb" id="tb-next">▷</button>
+        <button class="tb" id="tb-stop">■</button>
+        <button class="tb" id="tb-sl">−</button>
+        <span id="spd-ind">1×</span>
+        <button class="tb" id="tb-fa">+</button>
+        <div id="scrub-wrap"><input type="range" id="scrubber" min="0" value="0"></div>
+        <button class="tb fork-btn" id="tb-fork" onclick="openForkDialog()" title="Fork simulation from current step">⑂ Fork</button>
+        <div id="branch-sel-wrap" style="display:none">
+          <select id="branch-sel" onchange="activateBranch(this.value)" style="background:#142540;color:#00e5ff;border:1px solid #1e3a5f;border-radius:3px;font-size:.6rem;padding:2px 4px;font-family:var(--mono)">
+            <option value="main">● main</option>
+          </select>
+        </div>
+        <div class="tg">
+          <div class="tk"><span class="tkl">Spot</span><span class="tkv" id="tv-spot">—</span></div>
+          <div class="tk"><span class="tkl">WTI</span><span class="tkv" id="tv-wti">—</span></div>
+          <div class="tk"><span class="tkl">VLSFO</span><span class="tkv" id="tv-vlsfo">—</span></div>
+          <div class="tk"><span class="tkl">Fleet</span><span class="tkv" id="tv-fleet">—</span></div>
+          <div class="tk"><span class="tkl">S/D</span><span class="tkv" id="tv-sd">—</span></div>
+          <div class="tk" title="Fleet throughput factor — drops when rerouting makes voyages longer"><span class="tkl">Routing</span><span class="tkv" id="tv-rt">—</span></div>
+        </div>
+        <div id="cst-strip"></div>
+      </div>
+      <div id="map-body">
+        <div id="map"><div id="scanlines"></div><div id="rpop"></div></div>
+        <div id="side">
+          <div class="sec"><div class="sec-t">Fleet by Type</div><div id="fleet-bd"></div></div>
+          <div class="sec"><div class="sec-t">S/D Balance</div>
+            <div class="sdb"><div class="sdg"><div class="sdf" id="sd-fill"></div><div class="sdm"></div></div>
+            <div class="sdv" id="sd-val">—</div></div></div>
+          <div class="sec" style="flex:1"><div class="sec-t">Spot Rate History</div><canvas id="spark"></canvas></div>
+          <div class="sec"><div class="sec-t">Owners</div><div id="leg-owners"></div></div>
+          <div class="sec" style="padding-bottom:10px"><div class="sec-t">Vessel size</div><div id="leg-groups"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CONFIG TAB -->
+    <div class="panel" id="panel-config">
+      <div id="cnav"></div>
+      <div id="cfg-main">
+        <div id="cfg-title">Select a table →</div>
+        <div id="cfg-actions">
+          <button class="ab" onclick="saveTable()">💾 Save</button>
+          <button class="ab" onclick="resetTable()">↺ Reset to default</button>
+          <button id="add-row" onclick="addRow()">+ Add row</button>
+        </div>
+        <div class="ctw"><table class="ct"><thead id="ct-head"></thead><tbody id="ct-body"></tbody></table></div>
+      </div>
+    </div>
+
+    <!-- OBJECTS TAB -->
+    <div class="panel" id="panel-objects">
+      <div id="onav"></div>
+      <div id="obj-main">
+        <div id="obj-title" style="font-family:var(--mono);font-size:.7rem;color:var(--cy);padding:10px 14px;border-bottom:1px solid var(--b1)">Select an object type →</div>
+        <div id="obj-actions" style="display:none;padding:5px 8px;gap:6px;align-items:center;border-bottom:1px solid var(--b1)">
+          <button class="ab" onclick="saveObjTable()">💾 Save</button>
+          <button id="add-obj-row" onclick="addObjRow()">+ Add row</button>
+          <span id="obj-count" style="font-size:.58rem;color:var(--t3);margin-left:6px"></span>
+        </div>
+        <div class="ctw"><table class="ct"><thead id="ot-head"></thead><tbody id="ot-body"></tbody></table></div>
+      </div>
+    </div>
+
+    <!-- DASHBOARD TAB -->
+    <div class="panel" id="panel-dash"></div>
+
+    <!-- SCENARIO TAB -->
+    <div class="panel" id="panel-scenario">
+      <div class="sc-sec"><div class="sc-t">⚙ SIMULATION PARAMETERS</div><div class="pg" id="param-grid"></div></div>
+      <div class="sc-sec"><div class="sc-t">🎯 PRESETS</div><div class="prst-grid" id="prst-grid"></div></div>
+      <div class="sc-sec">
+        <div class="sc-t">⚡ QUICK EVENT</div>
+        <div class="pg">
+          <div class="pr"><label class="pl">Event type</label>
+            <select class="pi" id="qe-type">
+              <option value="node_closure">Node Closure</option>
+              <option value="demand_shock">Demand Shock</option>
+              <option value="sanction_ship_flag">Sanction (flag/company)</option>
+              <option value="supply_shock">Supply Shock</option>
+            </select></div>
+          <div class="pr"><label class="pl">Target (node/region/company)</label>
+            <input class="pi" id="qe-target" value="Strait of Hormuz"></div>
+          <div class="pr"><label class="pl">Apply on day</label>
+            <input class="pi" type="number" id="qe-day" value="30"></div>
+          <div class="pr"><label class="pl">End on day (blank = permanent)</label>
+            <input class="pi" type="number" id="qe-end" placeholder="blank=permanent"></div>
+          <div class="pr"><label class="pl">Multiplier (0=block, 1=no change)</label>
+            <input class="pi" type="number" id="qe-mult" value="0" step="0.05"></div>
+        </div>
+        <button class="ab" style="margin-top:9px" onclick="addEvent()">+ Add event &amp; re-run</button>
+      </div>
+    </div>
+
+    <!-- EXPORT TAB -->
+    <div class="panel" id="panel-settings"></div>
+    <div class="panel" id="panel-export">
+      <div class="xc"><h3>📄 Results CSV</h3><p>All time steps, market metrics, fleet counts, regional stats.</p>
+        <button class="xb" onclick="window.location='/api/export_csv'">⬇ Download CSV</button></div>
+      <div class="xc"><h3>🗂 Config Tables (JSON)</h3>
+        <p>All editable tables as a single JSON. Edit tables here, download, put CSVs in data/ folder for persistent overrides.</p>
+        <button class="xb" onclick="downloadTables()">⬇ Config JSON</button></div>
+      <div class="xc"><h3>🗺 Standalone Map HTML</h3>
+        <p>Self-contained animated map HTML file for sharing.</p>
+        <button class="xb" onclick="exportMap()">⬇ Export Map HTML</button></div>
+      <div class="xc" id="x-summary" style="display:none">
+        <h3>📊 Last Run Summary</h3>
+        <div id="x-sum-body" style="font-family:var(--mono);font-size:.66rem;color:var(--t2);line-height:2"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script src="/static/portal.js"></script>
+
+<!-- Fork dialog modal -->
+<div id="fork-modal">
+  <div id="fork-box">
+    <h3>⑂ Fork Simulation</h3>
+    <div class="fp">
+      <label>Branch name</label>
+      <input id="fork-name" type="text" placeholder="Branch @step N">
+    </div>
+    <div class="fp">
+      <label>Fork from step</label>
+      <input id="fork-step-val" type="number" min="0">
+    </div>
+    <div class="fp"><label>Parameter overrides (leave blank to inherit)</label>
+      <div class="fp-row">
+        <div><label>Spot rate ($/day)</label><input id="fork-spot" type="number" placeholder="inherit"></div>
+        <div><label>WTI price ($/bbl)</label><input id="fork-wti" type="number" placeholder="inherit"></div>
+        <div><label>VLSFO ($/t)</label><input id="fork-vlsfo" type="number" placeholder="inherit"></div>
+        <div><label>Scrapping threshold</label><input id="fork-scrapping" type="number" placeholder="inherit"></div>
+        <div><label>n_periods (total)</label><input id="fork-nperiods" type="number" placeholder="inherit"></div>
+      </div>
+    </div>
+    <div id="fork-actions">
+      <button id="fork-cancel" onclick="closeForkDialog()">Cancel</button>
+      <button id="fork-go" onclick="submitFork()">Run Fork →</button>
+    </div>
+  </div>
+</div>
+
+<!-- Branch panel (right side) -->
+<div id="branch-panel">
+  <div id="branch-panel-hdr">
+    <span>⑂ BRANCHES</span>
+    <button onclick="$('branch-panel').classList.remove('open')" style="background:none;border:none;color:#7a9abb;cursor:pointer;font-size:.8rem">✕</button>
+  </div>
+  <div id="branch-list"></div>
+</div>
+
+</body>
+</html>

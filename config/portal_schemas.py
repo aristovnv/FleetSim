@@ -333,15 +333,15 @@ def template_viz_routes() -> pd.DataFrame:
 
     add("USWC_SEASIA", "USWC", "SEASIA",
         "",
-        [[42.3,-122.0],[35,-130],[25,-148],[15,-160],[5,175],[4.2,114.5]])
+        [[42.3,-122.0],[35,-130],[25,-148],[15,-160],[10,-170],[5,-185],[3,-210],[3,-230],[4.2,-246]])
 
     add("USWC_KOR_JPN","USWC", "KOR/JPN",
         "",
-        [[42.3,-122.0],[40,-140],[38,-155],[36,-175],[35.2,133.6]])
+        [[42.3,-122.0],[40,-140],[38,-155],[37,-170],[36,-185],[35,-200],[35.2,-226.4]])
 
     add("USWC_CCHINA", "USWC", "CCHINA",
         "",
-        [[42.3,-122.0],[38,-140],[35,-155],[32,-175],[30,-180],[31,121]])
+        [[42.3,-122.0],[38,-140],[34,-158],[31,-175],[30,-190],[30,-208],[31,-239]])
 
     add("USWC_WCCAN",  "USWC", "WCCAN",
         "",
@@ -353,7 +353,7 @@ def template_viz_routes() -> pd.DataFrame:
 
     add("WCCAN_KOR_JPN","WCCAN", "KOR/JPN",
         "",
-        [[50.1,-124.8],[48,-130],[45,-145],[42,-160],[40,-175],[35.2,133.6]])
+        [[50.1,-124.8],[48,-130],[45,-145],[42,-160],[40,-175],[38,-195],[35.2,-226.4]])
 
     add("WCSAM_USG",   "WCSAM", "USG",
         "Panama Canal",
@@ -442,7 +442,7 @@ def template_viz_routes() -> pd.DataFrame:
 
     add("KOR_JPN_USWC", "KOR/JPN", "USWC",
         "",
-        [[35.2,133.6],[38,-150],[40,-165],[42.3,-122.0]])
+        [[35.2,133.6],[37,148],[40,163],[42,178],[42,195],[40,210],[40,225],[42.3,238]])
 
     # ── China regions ─────────────────────────────────────────────────────
     add("NCHINA_SCHINA","NCHINA", "SCHINA",
@@ -524,9 +524,9 @@ def template_viz_routes() -> pd.DataFrame:
 
     add("SAUS_USAC",    "SAUS", "USAC",
         "Cape Horn;Panama Canal",
-        [[-37,141.3],[-42,140],[-50,145],[-55.9,-67.2],[-52,-50],
-         [-40,-38],[-25,-28],[-10,-25],[5,-30],[9.1,-79.7],[10,-78],
-         [15,-72],[25,-68],[32,-68],[38,-75.2]])
+        [[-37,141.3],[-45,155],[-55,170],[-57,185],[-57,210],[-57,240],
+         [-56,260],[-55.9,292.8],[-52,305],[-40,320],[-25,332],[-10,330],
+         [5,325],[9.1,320],[15,312],[22,305],[30,300],[38,284.8]])
 
     # ── Pacific regions ───────────────────────────────────────────────────
     add("RUPAC_KOR_JPN","RUPAC", "KOR/JPN",
@@ -543,7 +543,7 @@ def template_viz_routes() -> pd.DataFrame:
 
     add("HAW_KOR_JPN",  "HAW", "KOR/JPN",
         "",
-        [[21.0,-157.2],[25,-165],[28,-175],[30,175],[32,160],[35.2,133.6]])
+        [[21.0,-157.2],[25,-165],[28,-175],[30,-185],[32,-200],[35.2,-226.4]])
 
     add("PI_KOR_JPN",   "PI", "KOR/JPN",
         "",
@@ -793,7 +793,8 @@ def template_table_registry() -> pd.DataFrame:
         dict(table_name="object_group_map",     label="Object → Groups",     group="Groups",    sort_order=30, enabled=True),
         # Conflict resolution rules
         dict(table_name="conflict_rules",       label="Conflict Rules",      group="Rules",     sort_order=31, enabled=True),
-        dict(table_name="node_vessel_limits",    label="Node Vessel Limits",  group="Rules",     sort_order=32, enabled=True),
+        dict(table_name="object_fields",         label="Field Specs",         group="Meta",      sort_order=40, enabled=True),
+        dict(table_name="object_lists",          label="Object Registry",     group="Meta",      sort_order=41, enabled=True),
         # Visual config
         dict(table_name="viz_companies",         label="Company Colors",      group="Visual",    sort_order=19, enabled=True),
         dict(table_name="viz_ship_groups",       label="Group Sizes",         group="Visual",    sort_order=20, enabled=True),
@@ -1105,8 +1106,6 @@ def template_conflict_rules() -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# node_vessel_limits  — configurable DWT/size limits per node
-# ─────────────────────────────────────────────────────────────────────────────
 def template_node_vessel_limits() -> pd.DataFrame:
     """
     DWT limits per node.  These are PHYSICAL constraints (canal locks, channel
@@ -1151,6 +1150,252 @@ def template_node_vessel_limits() -> pd.DataFrame:
              source_year=2024, enabled=True),
     ])
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# object_fields  — column specifications for every editable table
+# Drives the dynamic Config tab editor: types, labels, select options, refs
+# ─────────────────────────────────────────────────────────────────────────────
+def template_object_fields() -> pd.DataFrame:
+    """
+    Column metadata for every editable table.  The Config tab reads this to
+    render the right input widget for each cell:
+
+      field_type:
+        text        — plain text input
+        number      — numeric input (with optional min/max/step)
+        bool        — checkbox (values: True / False)
+        select      — dropdown; options= semicolon-separated values
+        group_ref   — links to groups.table group_id column
+        node_ref    — links to nodes.node_id column
+        region_ref  — links to regions.region_id column
+        vessel_ref  — links to vessel_groups.group_id
+        multiref    — comma-separated list of refs
+
+    editable: whether this column can be edited in the UI
+    required: whether the field must be non-empty on save
+    """
+    def F(table, field, label, ftype, options='', description='',
+          sort_order=0, editable=True, required=False,
+          min_val='', max_val='', step=''):
+        return dict(table_name=table, field_name=field, field_label=label,
+                    field_type=ftype, options=options, description=description,
+                    sort_order=sort_order, editable=editable, required=required,
+                    min_val=min_val, max_val=max_val, step=step)
+    rows = [
+        # ── groups ──────────────────────────────────────────────────────────
+        F('groups','group_id',      'Group ID',      'text',   required=True,  sort_order=1,
+          description='Unique key e.g. class:vlcc, flag:russia, region:opec'),
+        F('groups','name',          'Display Name',  'text',   required=True,  sort_order=2),
+        F('groups','object_type',   'Object Type',   'select',
+          options='vessel;region;company;node;route', sort_order=3, required=True),
+        F('groups','description',   'Description',   'text',   sort_order=4),
+        F('groups','sort_order',    'Order',         'number', sort_order=5, min_val='0', step='1'),
+        F('groups','enabled',       'Enabled',       'bool',   sort_order=6),
+
+        # ── group_hierarchy ──────────────────────────────────────────────────
+        F('group_hierarchy','parent_group_id','Parent Group','group_ref',required=True,sort_order=1),
+        F('group_hierarchy','child_group_id', 'Child Group', 'group_ref',required=True,sort_order=2),
+        F('group_hierarchy','description',    'Description', 'text',              sort_order=3),
+
+        # ── object_group_map ────────────────────────────────────────────────
+        F('object_group_map','object_id',   'Object ID',   'text',      required=True, sort_order=1),
+        F('object_group_map','object_type', 'Object Type', 'select',
+          options='vessel;region;company;node;route', sort_order=2, required=True),
+        F('object_group_map','group_id',    'Group',       'group_ref', required=True, sort_order=3),
+        F('object_group_map','notes',       'Notes',       'text',      sort_order=4),
+
+        # ── conflict_rules ───────────────────────────────────────────────────
+        F('conflict_rules','rule_id',       'Rule ID',     'text',   required=True, sort_order=1),
+        F('conflict_rules','rule_name',     'Rule Name',   'text',   required=True, sort_order=2),
+        F('conflict_rules','rule_type',     'Rule Type',   'select',
+          options='scrapping;ordering_priority;storage_preference;routing_preference',
+          sort_order=3, required=True),
+        F('conflict_rules','group_id',      'Group',       'group_ref', required=True, sort_order=4),
+        F('conflict_rules','priority_rank', 'Priority',    'number', min_val='1', step='1', sort_order=5),
+        F('conflict_rules','condition',     'Condition',   'text',   sort_order=6),
+        F('conflict_rules','enabled',       'Enabled',     'bool',   sort_order=7),
+        F('conflict_rules','description',   'Description', 'text',   sort_order=8),
+
+        # ── constraints ─────────────────────────────────────────────────────
+        F('constraints','constraint_id',  'ID',         'text', required=True, sort_order=1),
+        F('constraints','constraint_type','Type',       'select',
+          options='node_closure;node_capacity_change;node_group_ban;supply_shock;demand_shock;sanction_ship_flag;sanction_company;sanction_port;fuel_regulation;spot_price_shock;newbuild_limit',
+          sort_order=2, required=True),
+        F('constraints','target_nodes',   'Target Nodes',   'multiref', sort_order=3),
+        F('constraints','target_vessel_groups','Vessel Groups','multiref',sort_order=4),
+        F('constraints','target_regions', 'Regions',    'multiref', sort_order=5),
+        F('constraints','target_companies','Companies', 'multiref', sort_order=6),
+        F('constraints','apply_on_day',   'Start Day',  'number', min_val='0', step='1', sort_order=7),
+        F('constraints','end_on_day',     'End Day',    'number', min_val='0', step='1', sort_order=8),
+        F('constraints','multiplier',     'Multiplier', 'number', step='0.05', sort_order=9,
+          description='0=block, 1=no change, 1.5=+50%'),
+        F('constraints','additive',       'Additive',   'number', step='10', sort_order=10),
+        F('constraints','enabled',        'Enabled',    'bool',  sort_order=11),
+        F('constraints','description',    'Description','text',  sort_order=12),
+
+        # ── scenario_presets ─────────────────────────────────────────────────
+        F('scenario_presets','preset_id',       'Preset ID',   'text', required=True, sort_order=1),
+        F('scenario_presets','name',            'Name',        'text', required=True, sort_order=2),
+        F('scenario_presets','constraint_type', 'Constraint',  'select',
+          options='node_closure;node_group_ban;supply_shock;demand_shock;sanction_ship_flag;fuel_regulation;spot_price_shock',
+          sort_order=3),
+        F('scenario_presets','target_nodes',    'Target Nodes','multiref', sort_order=4),
+        F('scenario_presets','target_regions',  'Regions',     'multiref', sort_order=5),
+        F('scenario_presets','cfg_overrides',   'Config Overrides','text', sort_order=6,
+          description='key=value;key=value pairs to override portal_params'),
+        F('scenario_presets','apply_on_day',    'Start Day',   'number', min_val='0', sort_order=7),
+        F('scenario_presets','end_on_day',      'End Day',     'number', min_val='0', sort_order=8),
+        F('scenario_presets','multiplier',      'Multiplier',  'number', step='0.05', sort_order=9),
+        F('scenario_presets','enabled',         'Enabled',     'bool', sort_order=10),
+        F('scenario_presets','description',     'Description', 'text', sort_order=11),
+
+        # ── regions ──────────────────────────────────────────────────────────
+        F('regions','region',            'Region ID',       'text',   required=True, editable=False, sort_order=1),
+        F('regions','label',             'Display Label',   'text',   sort_order=2),
+        F('regions','tags',              'Tags',            'text',   sort_order=3,
+          description='Comma-separated: opec, eu_import, arctic, etc.'),
+        F('regions','spot_premium',      'Spot Premium',    'number', step='0.05', sort_order=4),
+        F('regions','fuel_premium',      'Fuel Premium',    'number', step='0.05', sort_order=5),
+        F('regions','max_vessel_dwt',    'Max DWT (t)',     'number', step='1000',  sort_order=6),
+
+        # ── nodes ────────────────────────────────────────────────────────────
+        F('nodes','node_id',         'Node ID',       'text',   required=True, editable=False, sort_order=1),
+        F('nodes','node_type',       'Type',          'select',
+          options='port;gateway;chokepoint;anchorage', sort_order=2),
+        F('nodes','is_gateway',      'Is Gateway',    'bool',   sort_order=3),
+        F('nodes','is_open',         'Is Open',       'bool',   sort_order=4),
+        F('nodes','transit_time_days','Transit Days', 'number', step='0.5', sort_order=5),
+
+        # ── vessel_groups ────────────────────────────────────────────────────
+        F('vessel_groups','group_id',   'Group ID',     'text',   required=True, sort_order=1),
+        F('vessel_groups','group_type', 'Group Type',   'select',
+          options='class;flag;build;scrubber;sts;trade;age', sort_order=2),
+        F('vessel_groups','min_dwt',    'Min DWT',      'number', step='1000', sort_order=3),
+        F('vessel_groups','max_dwt',    'Max DWT',      'number', step='1000', sort_order=4),
+        F('vessel_groups','description','Description',  'text',   sort_order=5),
+        F('vessel_groups','enabled',    'Enabled',      'bool',   sort_order=6),
+
+        # ── portal_params ────────────────────────────────────────────────────
+        F('portal_params','key',         'Parameter Key', 'text',   editable=False, sort_order=1),
+        F('portal_params','label',       'Label',         'text',   sort_order=2),
+        F('portal_params','default_val', 'Default Value', 'text',   sort_order=3),
+        F('portal_params','param_type',  'Type',          'select',
+          options='number;text;bool;select', sort_order=4),
+        F('portal_params','min_val',     'Min',           'number', sort_order=5),
+        F('portal_params','max_val',     'Max',           'number', sort_order=6),
+        F('portal_params','step',        'Step',          'number', sort_order=7),
+        F('portal_params','group',       'Group',         'text',   sort_order=8),
+        F('portal_params','description', 'Description',   'text',   sort_order=9),
+        F('portal_params','enabled',     'Enabled',       'bool',   sort_order=10),
+
+        # ── viz_regions ──────────────────────────────────────────────────────
+        F('viz_regions','region',      'Region ID',  'text',   editable=False, sort_order=1),
+        F('viz_regions','label',       'Label',      'text',   sort_order=2),
+        F('viz_regions','lat',         'Latitude',   'number', step='0.001', sort_order=3),
+        F('viz_regions','lon',         'Longitude',  'number', step='0.001', sort_order=4),
+        F('viz_regions','popup_fields','Popup Fields','text',  sort_order=5,
+          description='Comma-separated fields shown in hover/click popup'),
+        F('viz_regions','enabled',     'Enabled',    'bool',   sort_order=6),
+
+        # ── viz_nodes ────────────────────────────────────────────────────────
+        F('viz_nodes','node',          'Node ID',    'text',   editable=False, sort_order=1),
+        F('viz_nodes','label',         'Label',      'text',   sort_order=2),
+        F('viz_nodes','lat',           'Latitude',   'number', step='0.001', sort_order=3),
+        F('viz_nodes','lon',           'Longitude',  'number', step='0.001', sort_order=4),
+        F('viz_nodes','is_gateway',    'Is Gateway', 'bool',   sort_order=5),
+        F('viz_nodes','color_open',    'Color Open', 'text',   sort_order=6),
+        F('viz_nodes','color_closed',  'Color Closed','text',  sort_order=7),
+        F('viz_nodes','enabled',       'Enabled',    'bool',   sort_order=8),
+
+        # ── viz_routes ───────────────────────────────────────────────────────
+        F('viz_routes','route_id',    'Route ID',   'text',   sort_order=1),
+        F('viz_routes','seq',         'Seq',        'number', step='1', sort_order=2),
+        F('viz_routes','lat',         'Lat',        'number', step='0.001', sort_order=3),
+        F('viz_routes','lon',         'Lon',        'number', step='0.001', sort_order=4),
+        F('viz_routes','enabled',     'Enabled',    'bool',   sort_order=5),
+
+        # ── edges ────────────────────────────────────────────────────────────
+        F('edges','from_node',            'From',              'node_ref', required=True, sort_order=1),
+        F('edges','to_node',              'To',                'node_ref', required=True, sort_order=2),
+        F('edges','distance_nm',          'Distance (nm)',     'number', step='50',  sort_order=3),
+        F('edges','base_transit_mean_days','Transit Days',     'number', step='0.5', sort_order=4),
+        F('edges','base_transit_std_days', 'Transit Std',      'number', step='0.5', sort_order=5),
+        F('edges','requires_nodes',       'Required Nodes',    'multiref', sort_order=6),
+        F('edges','alternate_for',        'Alternate For',     'multiref', sort_order=7),
+
+        # ── portal_settings ───────────────────────────────────────────────────
+        F('portal_settings','key',  'Setting Key','text',   editable=False, sort_order=1),
+        F('portal_settings','value','Value',      'text',   sort_order=2),
+        F('portal_settings','label','Label',      'text',   editable=False, sort_order=3),
+    ]
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# object_lists  — registry of all domain-object tables
+# Each row = one navigable entity table. The Config "Objects" section
+# reads this to build navigation and uses object_fields to render columns.
+# ─────────────────────────────────────────────────────────────────────────────
+def template_object_lists() -> pd.DataFrame:
+    """
+    Registry of domain-object tables — things that EXIST in the simulation
+    (vessels, companies, regions, nodes, products, groups…) as opposed to
+    configuration/rules tables.
+
+    Columns:
+      table_name    — key matching tables[] in the browser
+      label         — display name in the Objects nav panel  
+      object_type   — vessel | region | company | node | product | group | route
+      id_field      — the primary-key column name in that table
+      label_field   — the human-readable name column
+      description   — one-liner about what this table contains
+      icon          — emoji icon for nav
+      sort_order    — display order in nav
+      enabled       — show in UI
+    """
+    return pd.DataFrame([
+        dict(table_name='fleet',          label='Fleet',           object_type='vessel',
+             id_field='vessel_id',  label_field='ship_type',
+             description='Active vessel fleet — counts per type and owner',
+             icon='🚢', sort_order=1, enabled=True),
+        dict(table_name='ship_types',     label='Ship Types',      object_type='vessel',
+             id_field='name',       label_field='name',
+             description='Vessel class specifications: DWT, speed, opex, build cost',
+             icon='⚓', sort_order=2, enabled=True),
+        dict(table_name='vessel_groups',  label='Vessel Groups',   object_type='vessel',
+             id_field='group_id',   label_field='group_id',
+             description='Named vessel groups: class:vlcc, flag:russia, age:old …',
+             icon='🏷', sort_order=3, enabled=True),
+        dict(table_name='companies',      label='Companies',       object_type='company',
+             id_field='name',       label_field='name',
+             description='Oil companies: supply/demand regions, sanctionability',
+             icon='🏢', sort_order=4, enabled=True),
+        dict(table_name='regions',        label='Regions',         object_type='region',
+             id_field='region',     label_field='label',
+             description='Geographic trading regions: supply, demand, storage',
+             icon='🗺', sort_order=5, enabled=True),
+        dict(table_name='nodes',          label='Nodes / Chokepoints', object_type='node',
+             id_field='node_id',    label_field='node_id',
+             description='Ports, gateways, chokepoints — transit constraints',
+             icon='🔀', sort_order=6, enabled=True),
+        dict(table_name='edges',          label='Trade Routes',    object_type='route',
+             id_field='',           label_field='',
+             description='Directed shipping routes with distance and transit days',
+             icon='📍', sort_order=7, enabled=True),
+        dict(table_name='groups',         label='Groups',          object_type='group',
+             id_field='group_id',   label_field='name',
+             description='All named groups — vessels, regions, companies, nodes',
+             icon='📦', sort_order=8, enabled=True),
+        dict(table_name='object_group_map', label='Group Memberships', object_type='group',
+             id_field='',           label_field='',
+             description='Maps objects to their groups',
+             icon='🔗', sort_order=9, enabled=True),
+        dict(table_name='constraints',    label='Constraints',     object_type='rule',
+             id_field='constraint_id', label_field='description',
+             description='Active scenario constraints including node_group_ban rules',
+             icon='🚫', sort_order=10, enabled=True),
+    ])
+
 # ALL_PORTAL_TEMPLATES  — registered here, loaded by portal.py
 # ─────────────────────────────────────────────────────────────────────────────
 ALL_PORTAL_TEMPLATES = {
@@ -1168,5 +1413,6 @@ ALL_PORTAL_TEMPLATES = {
     "group_hierarchy":   template_group_hierarchy,
     "object_group_map":  template_object_group_map,
     "conflict_rules":     template_conflict_rules,
-    "node_vessel_limits":  template_node_vessel_limits,
+    "object_fields":       template_object_fields,
+    "object_lists":        template_object_lists,
 }
