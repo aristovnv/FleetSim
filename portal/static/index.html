@@ -15,18 +15,18 @@
   <div id="topbar">
     <div id="logo">⬡ MARITIME SIM <span>v3 · all data-driven</span></div>
     <div id="tabs">
-      <div class="tab active" data-tab="map">🗺 MAP</div>
-      <div class="tab" data-tab="config">⚙ CONFIG</div>
-      <div class="tab" data-tab="objects">📦 OBJECTS</div>
-      <div class="tab" data-tab="dash">📊 DASHBOARD</div>
-      <div class="tab" data-tab="scenario">🎯 SCENARIO</div>
-      <div class="tab" data-tab="export">💾 EXPORT</div>
-      <div class="tab" data-tab="settings">⚙ SETTINGS</div>
+      <div class="tab active" data-tab="map"     title="Animated vessel map — step through the simulation and see ship positions, region balances, and chokepoint status">🗺 MAP</div>
+      <div class="tab" data-tab="config"          title="Edit all simulation tables (fleet, routes, constraints, ship types, etc.) — changes persist until server restart unless saved to CSV">⚙ CONFIG</div>
+      <div class="tab" data-tab="objects"         title="Browse and edit domain objects (companies, regions, nodes, vessel groups) with rich field types">📦 OBJECTS</div>
+      <div class="tab" data-tab="dash"            title="Time-series charts for spot rate, utilisation, fleet composition, S/D ratio, fuel prices and routing efficiency">📊 DASHBOARD</div>
+      <div class="tab" data-tab="scenario"        title="Set simulation parameters, apply presets, and inject quick events (node closure, demand/supply shocks, sanctions)">🎯 SCENARIO</div>
+      <div class="tab" data-tab="export"          title="Download results as CSV, export config tables as JSON, or save a standalone animated map HTML">💾 EXPORT</div>
+      <div class="tab" data-tab="settings"        title="Portal display settings — map style, overlay visibility, animation speed defaults">⚙ SETTINGS</div>
     </div>
     <div id="run-area">
       <span id="run-txt">no result yet</span>
       <div id="run-prog"><div id="run-prog-bar"></div></div>
-      <button id="run-btn" onclick="startRun()">INIT</button>
+      <button id="run-btn" onclick="startRun()" title="Initialise and run the simulation — first run loads all tables; subsequent clicks re-run with current settings">INIT</button>
     </div>
   </div>
 
@@ -35,14 +35,14 @@
     <div class="panel active" id="panel-map">
       <div id="tbar">
         <div id="date-bd">----</div><div id="step-bd">—</div>
-        <button class="tb" id="tb-prev">◀</button>
-        <button class="tb" id="tb-play">▶</button>
-        <button class="tb" id="tb-next">▷</button>
-        <button class="tb" id="tb-stop">■</button>
-        <button class="tb" id="tb-sl">−</button>
-        <span id="spd-ind">1×</span>
-        <button class="tb" id="tb-fa">+</button>
-        <div id="scrub-wrap"><input type="range" id="scrubber" min="0" value="0"></div>
+        <button class="tb" id="tb-prev" title="Step back one period">◀</button>
+        <button class="tb" id="tb-play" title="Play / pause animation">▶</button>
+        <button class="tb" id="tb-next" title="Step forward one period">▷</button>
+        <button class="tb" id="tb-stop" title="Stop and return to step 0">■</button>
+        <button class="tb" id="tb-sl"   title="Slow down playback">−</button>
+        <span id="spd-ind" title="Current playback speed">1×</span>
+        <button class="tb" id="tb-fa"   title="Speed up playback">+</button>
+        <div id="scrub-wrap"><input type="range" id="scrubber" min="0" value="0" title="Drag to jump to any simulation step"></div>
         <button class="tb fork-btn" id="tb-fork" onclick="openForkDialog()" title="Fork simulation from current step">⑂ Fork</button>
         <div id="branch-sel-wrap" style="display:none">
           <select id="branch-sel" onchange="activateBranch(this.value)" style="background:#142540;color:#00e5ff;border:1px solid #1e3a5f;border-radius:3px;font-size:.6rem;padding:2px 4px;font-family:var(--mono)">
@@ -50,12 +50,12 @@
           </select>
         </div>
         <div class="tg">
-          <div class="tk"><span class="tkl">Spot</span><span class="tkv" id="tv-spot">—</span></div>
-          <div class="tk"><span class="tkl">WTI</span><span class="tkv" id="tv-wti">—</span></div>
-          <div class="tk"><span class="tkl">VLSFO</span><span class="tkv" id="tv-vlsfo">—</span></div>
-          <div class="tk"><span class="tkl">Fleet</span><span class="tkv" id="tv-fleet">—</span></div>
-          <div class="tk"><span class="tkl">S/D</span><span class="tkv" id="tv-sd">—</span></div>
-          <div class="tk" title="Fleet throughput factor — drops when rerouting makes voyages longer"><span class="tkl">Routing</span><span class="tkv" id="tv-rt">—</span></div>
+          <div class="tk" title="Current spot charter rate ($/day) for a VLCC — weighted average across active fixtures"><span class="tkl">Spot</span><span class="tkv" id="tv-spot">—</span></div>
+          <div class="tk" title="WTI crude oil price ($/barrel)"><span class="tkl">WTI</span><span class="tkv" id="tv-wti">—</span></div>
+          <div class="tk" title="VLSFO bunker fuel price ($/tonne) — Very Low Sulphur Fuel Oil, the primary marine fuel"><span class="tkl">VLSFO</span><span class="tkv" id="tv-vlsfo">—</span></div>
+          <div class="tk" title="Active fleet size (number of vessels currently in service, excluding storage mode)"><span class="tkl">Fleet</span><span class="tkv" id="tv-fleet">—</span></div>
+          <div class="tk" title="Supply/Demand ratio — values above 1.0 mean more supply than demand (bearish); below 1.0 is bullish for rates"><span class="tkl">S/D</span><span class="tkv" id="tv-sd">—</span></div>
+          <div class="tk" title="Fleet throughput factor — drops below 1.0 when chokepoint closures force rerouting and make voyages longer (e.g. Suez closure → ~0.46)"><span class="tkl">Routing</span><span class="tkv" id="tv-rt">—</span></div>
         </div>
         <div id="cst-strip"></div>
       </div>
@@ -79,9 +79,9 @@
       <div id="cfg-main">
         <div id="cfg-title">Select a table →</div>
         <div id="cfg-actions">
-          <button class="ab" onclick="saveTable()">💾 Save</button>
-          <button class="ab" onclick="resetTable()">↺ Reset to default</button>
-          <button id="add-row" onclick="addRow()">+ Add row</button>
+          <button class="ab" onclick="saveTable()"   title="Save current edits to the in-memory table — changes take effect on the next simulation run">💾 Save</button>
+          <button class="ab" onclick="resetTable()"  title="Discard all edits and reload this table from the original CSV on disk">↺ Reset to default</button>
+          <button id="add-row" onclick="addRow()"    title="Append a blank row to this table">+ Add row</button>
         </div>
         <div class="ctw"><table class="ct"><thead id="ct-head"></thead><tbody id="ct-body"></tbody></table></div>
       </div>
@@ -93,8 +93,8 @@
       <div id="obj-main">
         <div id="obj-title" style="font-family:var(--mono);font-size:.7rem;color:var(--cy);padding:10px 14px;border-bottom:1px solid var(--b1)">Select an object type →</div>
         <div id="obj-actions" style="display:none;padding:5px 8px;gap:6px;align-items:center;border-bottom:1px solid var(--b1)">
-          <button class="ab" onclick="saveObjTable()">💾 Save</button>
-          <button id="add-obj-row" onclick="addObjRow()">+ Add row</button>
+          <button class="ab" onclick="saveObjTable()" title="Save current edits to the in-memory table — takes effect on next run">💾 Save</button>
+          <button id="add-obj-row" onclick="addObjRow()" title="Append a blank row to this object list">+ Add row</button>
           <span id="obj-count" style="font-size:.58rem;color:var(--t3);margin-left:6px"></span>
         </div>
         <div class="ctw"><table class="ct"><thead id="ot-head"></thead><tbody id="ot-body"></tbody></table></div>
@@ -112,22 +112,22 @@
         <div class="sc-t">⚡ QUICK EVENT</div>
         <div class="pg">
           <div class="pr"><label class="pl">Event type</label>
-            <select class="pi" id="qe-type">
+            <select class="pi" id="qe-type" title="Type of event to inject into the simulation">
               <option value="node_closure">Node Closure</option>
               <option value="demand_shock">Demand Shock</option>
               <option value="sanction_ship_flag">Sanction (flag/company)</option>
               <option value="supply_shock">Supply Shock</option>
             </select></div>
           <div class="pr"><label class="pl">Target (node/region/company)</label>
-            <input class="pi" id="qe-target" value="Strait of Hormuz"></div>
+            <input class="pi" id="qe-target" value="Strait of Hormuz" title="Name of the node, region, or company to target — e.g. 'Suez Canal', 'MED', 'Rosneft'"></div>
           <div class="pr"><label class="pl">Apply on day</label>
-            <input class="pi" type="number" id="qe-day" value="30"></div>
+            <input class="pi" type="number" id="qe-day" value="30" title="Simulation day on which this event begins (day 0 = start of simulation)"></div>
           <div class="pr"><label class="pl">End on day (blank = permanent)</label>
-            <input class="pi" type="number" id="qe-end" placeholder="blank=permanent"></div>
+            <input class="pi" type="number" id="qe-end" placeholder="blank=permanent" title="Day the event ends — leave blank for a permanent shock"></div>
           <div class="pr"><label class="pl">Multiplier (0=block, 1=no change)</label>
-            <input class="pi" type="number" id="qe-mult" value="0" step="0.05"></div>
+            <input class="pi" type="number" id="qe-mult" value="0" step="0.05" title="Scaling factor applied to supply, demand, or capacity — 0 = complete blockage, 0.5 = halved, 1 = no effect"></div>
         </div>
-        <button class="ab" style="margin-top:9px" onclick="addEvent()">+ Add event &amp; re-run</button>
+        <button class="ab" style="margin-top:9px" onclick="addEvent()" title="Add this event to the constraints table and immediately re-run the simulation">+ Add event &amp; re-run</button>
       </div>
     </div>
 
@@ -135,13 +135,13 @@
     <div class="panel" id="panel-settings"></div>
     <div class="panel" id="panel-export">
       <div class="xc"><h3>📄 Results CSV</h3><p>All time steps, market metrics, fleet counts, regional stats.</p>
-        <button class="xb" onclick="window.location='/api/export_csv'">⬇ Download CSV</button></div>
+        <button class="xb" onclick="window.location='/api/export_csv'" title="Download a CSV with one row per simulation step — spot rate, fleet counts, utilisation, S/D ratio, fuel prices, constraints active">⬇ Download CSV</button></div>
       <div class="xc"><h3>🗂 Config Tables (JSON)</h3>
         <p>All editable tables as a single JSON. Edit tables here, download, put CSVs in data/ folder for persistent overrides.</p>
-        <button class="xb" onclick="downloadTables()">⬇ Config JSON</button></div>
+        <button class="xb" onclick="downloadTables()" title="Download all in-memory config tables as JSON — useful for inspecting what the simulation actually ran with">⬇ Config JSON</button></div>
       <div class="xc"><h3>🗺 Standalone Map HTML</h3>
         <p>Self-contained animated map HTML file for sharing.</p>
-        <button class="xb" onclick="exportMap()">⬇ Export Map HTML</button></div>
+        <button class="xb" onclick="exportMap()" title="Generate a standalone HTML file with the animated vessel map — shareable without running the portal server">⬇ Export Map HTML</button></div>
       <div class="xc" id="x-summary" style="display:none">
         <h3>📊 Last Run Summary</h3>
         <div id="x-sum-body" style="font-family:var(--mono);font-size:.66rem;color:var(--t2);line-height:2"></div>
@@ -159,24 +159,24 @@
     <h3>⑂ Fork Simulation</h3>
     <div class="fp">
       <label>Branch name</label>
-      <input id="fork-name" type="text" placeholder="Branch @step N">
+      <input id="fork-name" type="text" placeholder="Branch @step N" title="Label for this branch — shown in the branch selector and on chart fork markers">
     </div>
     <div class="fp">
       <label>Fork from step</label>
-      <input id="fork-step-val" type="number" min="0">
+      <input id="fork-step-val" type="number" min="0" title="The simulation step from which the branch diverges — all prior history is shared with the main run">
     </div>
     <div class="fp"><label>Parameter overrides (leave blank to inherit)</label>
       <div class="fp-row">
-        <div><label>Spot rate ($/day)</label><input id="fork-spot" type="number" placeholder="inherit"></div>
-        <div><label>WTI price ($/bbl)</label><input id="fork-wti" type="number" placeholder="inherit"></div>
-        <div><label>VLSFO ($/t)</label><input id="fork-vlsfo" type="number" placeholder="inherit"></div>
-        <div><label>Scrapping threshold</label><input id="fork-scrapping" type="number" placeholder="inherit"></div>
-        <div><label>n_periods (total)</label><input id="fork-nperiods" type="number" placeholder="inherit"></div>
+        <div><label>Spot rate ($/day)</label><input id="fork-spot"      type="number" placeholder="inherit" title="Override starting spot rate for this branch"></div>
+        <div><label>WTI price ($/bbl)</label><input id="fork-wti"       type="number" placeholder="inherit" title="Override WTI oil price for this branch"></div>
+        <div><label>VLSFO ($/t)</label>       <input id="fork-vlsfo"    type="number" placeholder="inherit" title="Override VLSFO bunker fuel price for this branch"></div>
+        <div><label>Scrapping threshold</label><input id="fork-scrapping" type="number" placeholder="inherit" title="Override the spot rate below which vessels get scrapped ($/day)"></div>
+        <div><label>n_periods (total)</label> <input id="fork-nperiods" type="number" placeholder="inherit" title="Override total number of simulation periods for this branch"></div>
       </div>
     </div>
     <div id="fork-actions">
-      <button id="fork-cancel" onclick="closeForkDialog()">Cancel</button>
-      <button id="fork-go" onclick="submitFork()">Run Fork →</button>
+      <button id="fork-cancel" onclick="closeForkDialog()" title="Cancel and discard fork settings">Cancel</button>
+      <button id="fork-go"     onclick="submitFork()"    title="Create a branch from the selected step and run it with the specified parameter overrides">Run Fork →</button>
     </div>
   </div>
 </div>

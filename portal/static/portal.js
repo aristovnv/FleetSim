@@ -725,6 +725,20 @@ function drawChart(cfg){
     ctx.beginPath();ctx.strokeStyle=s.color;ctx.lineWidth=1.4;ctx.setLineDash([]);
     s.data.forEach((v,i)=>i?ctx.lineTo(toX(i),toY(v)):ctx.moveTo(toX(i),toY(v)));ctx.stroke();
   });
+  // Draw branch fork markers
+  fetch('/api/branches').then(r=>r.json()).then(data=>{
+    (data.branches||[]).forEach(b=>{
+      const n=SIM.steps.length; if(n<2)return;
+      const fx=toX(b.fork_step);
+      ctx.save();
+      ctx.strokeStyle=b.color;ctx.lineWidth=1;ctx.setLineDash([3,3]);
+      ctx.beginPath();ctx.moveTo(fx,P.t);ctx.lineTo(fx,P.t+CH);ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle=b.color;ctx.font='9px Share Tech Mono';
+      ctx.fillText('⑂',fx+2,P.t+10);
+      ctx.restore();
+    });
+  }).catch(()=>{});
   const xstep=Math.ceil(SIM.steps.length/8);
   ctx.fillStyle='#3d5a78';ctx.font='9px Share Tech Mono';
   SIM.steps.forEach((_,i)=>{if(i%xstep===0)ctx.fillText(SIM.steps[i].date,toX(i)-12,H-3);});
@@ -1197,28 +1211,3 @@ async function refreshBranchPanel(){
 }
 
 function $B(id){return document.getElementById(id);}
-
-// Chart overlay: draw fork marker
-const _origDrawChart=drawChart;
-function drawChart(cfg,steps,canvasId){
-  _origDrawChart(cfg,steps,canvasId);
-  // Draw fork lines for all branches
-  fetch('/api/branches').then(r=>r.json()).then(data=>{
-    const branches=data.branches||[];
-    branches.forEach(b=>{
-      const canvas=$B(canvasId);
-      if(!canvas)return;
-      const ctx=canvas.getContext('2d');
-      const n=steps.length;
-      if(n<2)return;
-      const x=Math.round((b.fork_step/Math.max(n-1,1))*canvas.width);
-      ctx.save();
-      ctx.strokeStyle=b.color;ctx.lineWidth=1;ctx.setLineDash([3,3]);
-      ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle=b.color;ctx.font='9px monospace';
-      ctx.fillText('⑂',x+2,12);
-      ctx.restore();
-    });
-  }).catch(()=>{});
-}
