@@ -115,6 +115,36 @@ def build_type_owner_map() -> dict:
             result.setdefault(f"__pat__{pat}", name)
     return result
 
+def build_owner_supply_routes(route_index: dict) -> dict:
+    """
+    {owner: [route_key, ...]} — routes that START from that owner's supply regions.
+    Derived from companies.supply_regions vs route_index[key]['from'].
+    Falls back to all routes if no match found.
+    """
+    # company → supply regions
+    company_supply: dict = {}
+    for r in get_table("companies"):
+        name = str(r.get("name") or "").strip()
+        srs  = [x.strip() for x in str(r.get("supply_regions") or "").split(",") if x.strip()]
+        if name and srs:
+            company_supply[name] = set(srs)
+
+    # owner (from fleet) → supply regions (via companies table)
+    owner_supply: dict = {}
+    for r in get_table("fleet"):
+        owner = str(r.get("owner") or "").strip()
+        if owner and owner in company_supply:
+            owner_supply.setdefault(owner, set()).update(company_supply[owner])
+
+    # build route lists per owner
+    all_keys = list(route_index.keys())
+    result: dict = {}
+    for owner, supply_regions in owner_supply.items():
+        keys = [k for k, v in route_index.items() if v.get("from") in supply_regions]
+        result[owner] = keys if keys else all_keys
+    return result
+
+
 def type_to_owner(st_name: str, tmap: dict) -> str:
     if st_name in tmap:
         return tmap[st_name]
@@ -202,6 +232,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
         type_owner_map = build_type_owner_map()
 
         route_keys = list(route_index.keys())
+        owner_routes = build_owner_supply_routes(route_index)
         rng = random.Random(int(run_cfg.get("seed", 42)))
 
         # v3 engine uses vessels_{vessel_id} columns
@@ -212,6 +243,13 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
             type_cols = [c for c in df.columns
                          if c.startswith("active_") and c != "active_constraints"]
         col_prefix = "vessels_" if type_cols and type_cols[0].startswith("vessels_") else "active_"
+
+        def pick_route(owner: str, vid: int) -> str:
+            """Pick a route for this vessel based on owner's supply regions."""
+            keys = owner_routes.get(owner) or route_keys
+            if not keys:
+                return ""
+            return keys[vid % len(keys)]
 
         # Populate initial vessel list
         vessels, vid = [], 0
@@ -225,7 +263,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
             for _ in range(count):
                 vessels.append(dict(
                     id=vid, type=st, group=group, owner=owner, color=color, radius=radius,
-                    route_key=route_keys[vid % len(route_keys)] if route_keys else "",
+                    route_key=pick_route(owner, vid),
                     progress=rng.uniform(0, 1), speed=rng.uniform(0.025, 0.055), status="active",
                 ))
                 vid += 1
@@ -246,7 +284,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
                     for _ in range(diff):
                         vessels.append(dict(
                             id=vid, type=st, group=group, owner=owner, color=color, radius=radius,
-                            route_key=route_keys[vid % len(route_keys)] if route_keys else "",
+                            route_key=pick_route(owner, vid),
                             progress=rng.uniform(0, 1), speed=rng.uniform(0.025, 0.055), status="active",
                         ))
                         vid += 1
@@ -275,11 +313,18 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
 
         STATE["sim_progress"] = 90
 
+        # Build per-step flow counts: {from→to: {group: count, dwt_kt: total}}
+        # We have vessel list at each step - aggregate by route from/to
+        ship_type_dwt = {}
+        for r in get_table("ship_types"):
+            if r.get("name"):
+                ship_type_dwt[r["name"]] = float(r.get("dwt_mean") or 0) / 1000  # in kt
+
         steps = []
         region_names = list(region_coords.keys())
         node_names   = list(node_coords.keys())
 
-        for _, row in df.iterrows():
+        for step_i, (_, row) in enumerate(df.iterrows()):
             fleet_bd = {col[len(col_prefix):]: int(row[col]) for col in type_cols}
 
             regions_data = {}
@@ -294,6 +339,25 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
             for nn in node_names:
                 nk = "node_" + nn.replace(" ", "_").replace(".", "")
                 nodes_data[nn] = bool(int(row.get(nk, 1) or 1))
+
+            # Flows: count active vessels per (from_region, to_region) pair
+            flows = {}
+            if step_i < len(frames):
+                frame_ids = {v["id"] for v in frames[step_i]}
+                for v in vessels:
+                    if v["id"] not in frame_ids:
+                        continue
+                    rt = route_index.get(v["route_key"], {})
+                    fr = rt.get("from", ""); to = rt.get("to", "")
+                    if fr and to:
+                        key = f"{fr}→{to}"
+                        if key not in flows:
+                            flows[key] = {"count": 0, "dwt_kt": 0, "groups": {}}
+                        flows[key]["count"] += 1
+                        flows[key]["dwt_kt"] = round(
+                            flows[key]["dwt_kt"] + ship_type_dwt.get(v["type"], 0), 0)
+                        g = v["group"]
+                        flows[key]["groups"][g] = flows[key]["groups"].get(g, 0) + 1
 
             steps.append(_clean(dict(
                 date          = str(row["date_label"]),
@@ -311,6 +375,7 @@ def run_simulation_task(run_cfg: dict, tables_snap: dict):
                 fleet         = fleet_bd,
                 regions       = regions_data,
                 nodes         = nodes_data,
+                flows         = flows,
             )))
 
         STATE["sim_result"] = _clean(dict(

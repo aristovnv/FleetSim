@@ -103,6 +103,12 @@ html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(
 .ll{font-size:.62rem;color:var(--t2)}
 .sr{display:flex;align-items:center;gap:4px;margin-bottom:2px}
 .sg{border-radius:50%;border:1.5px solid var(--t3);flex-shrink:0}
+/* FLOWS */
+.flow-row{display:grid;grid-template-columns:1fr auto auto;gap:4px;align-items:baseline;margin-bottom:4px;padding-bottom:3px;border-bottom:1px solid var(--b1)}
+.flow-row:last-child{border-bottom:none}
+.flow-rt{font-family:var(--mono);font-size:.58rem;color:var(--cy);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.flow-info{font-size:.56rem;color:var(--t3);text-align:right;white-space:nowrap}
+.flow-dwt{font-family:var(--mono);font-size:.56rem;color:var(--t2);text-align:right;white-space:nowrap;min-width:42px}
 /* CONFIG */
 #panel-config{flex-direction:row;overflow:hidden}
 #panel-objects{flex-direction:row;overflow:hidden}
@@ -168,10 +174,17 @@ canvas.ch{width:100%;display:block}
 .rpin-sub{font-family:var(--mono);font-size:.55rem;color:var(--t3)}
 .rpin-x{background:none;border:none;color:var(--t3);cursor:pointer;font-size:.8rem;padding:0 2px;line-height:1;flex-shrink:0;transition:color .1s}
 .rpin-x:hover{color:var(--rd)}
-.rpin-body{padding:7px 10px 4px}
+.rpin-body{padding:7px 10px 4px;max-height:260px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--cy2) transparent}
 .rprow{display:flex;justify-content:space-between;gap:8px;margin-bottom:3px;font-size:.65rem}
 .rpk{color:var(--t2)}
 .rpv{font-family:var(--mono);color:var(--t1)}
 .rpin-spark{width:100%;display:block;border-top:1px solid var(--b1);padding:4px 0}
+.rpflow-hdr{font-family:var(--mono);font-size:.52rem;letter-spacing:.1em;color:var(--t3);text-transform:uppercase;margin:6px 0 3px;padding-top:5px;border-top:1px solid var(--b1)}
+.rpflow-list{display:flex;flex-direction:column;gap:3px}
+.rpflow{display:grid;grid-template-columns:12px 1fr auto auto;gap:4px;align-items:baseline;font-size:.6rem}
+.rpflow-dir{color:var(--cy);font-size:.65rem}
+.rpflow-to{font-family:var(--mono);color:var(--cy)}
+.rpflow-grp{color:var(--t3);text-align:right}
+.rpflow-dwt{font-family:var(--mono);color:var(--t2);text-align:right;min-width:38px}
 
 ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:2px}

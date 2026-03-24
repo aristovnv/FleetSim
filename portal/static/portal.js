@@ -254,6 +254,7 @@ function updateSpark(upTo){
   ctx.beginPath();ctx.arc(lx,ly,2.5,0,Math.PI*2);ctx.fillStyle='#00e5ff';ctx.fill();
 }
 
+
 function buildLegend(){
   // Legend is built from viz_companies and viz_ship_groups tables — not hardcoded
   $('leg-owners').innerHTML=(tables.viz_companies||[]).map(r=>
@@ -966,6 +967,22 @@ function pinRegionPanel(name, coords) {
 let _zCounter = 2100;
 function nextZ(){ return ++_zCounter; }
 
+function flowsForRegion(name, sd) {
+  const flows = sd.flows || {};
+  const rows = Object.entries(flows)
+    .filter(([k]) => k.startsWith(name+'→') || k.endsWith('→'+name))
+    .sort((a,b) => b[1].dwt_kt - a[1].dwt_kt);
+  if (!rows.length) return '';
+  const items = rows.map(([route, v]) => {
+    const dir = route.startsWith(name+'→') ? '▶' : '◀';
+    const other = route.startsWith(name+'→') ? route.slice(name.length+1) : route.split('→')[0];
+    const groups = Object.entries(v.groups||{}).map(([g,n])=>`${n}×${g}`).join(' ');
+    const dwt = v.dwt_kt >= 1000 ? (v.dwt_kt/1000).toFixed(1)+'M t' : (v.dwt_kt||0)+' kt';
+    return `<div class="rpflow"><span class="rpflow-dir">${dir}</span><span class="rpflow-to">${other}</span><span class="rpflow-grp">${groups}</span><span class="rpflow-dwt">${dwt}</span></div>`;
+  }).join('');
+  return `<div class="rpflow-hdr">In Transit</div><div class="rpflow-list">${items}</div>`;
+}
+
 function buildPinContent(name, coords, sd) {
   const rd = (sd.regions||{})[name]||{};
   const fields = (coords.popup_fields||'supply,demand,storage').split(',');
@@ -985,6 +1002,7 @@ function buildPinContent(name, coords, sd) {
       ${rows}
       <div class="rprow"><span class="rpk">D/S ratio</span><span class="rpv">${dsRatio}</span></div>
       <div class="rprow"><span class="rpk">Balance</span><span class="rpv" style="color:${balCol}">${bal>=0?'+':''}${bal.toFixed(2)} MMT</span></div>
+      <div id="rpinf-${name}">${flowsForRegion(name, sd)}</div>
     </div>
     <canvas class="rpin-spark" id="rpinspark-${name}" height="40"></canvas>`;
 }
@@ -1004,7 +1022,8 @@ function updatePinnedPanel(name) {
   const bodyEl = document.getElementById('rpinb-'+name);
   if(bodyEl) bodyEl.innerHTML = rows +
     `<div class="rprow"><span class="rpk">D/S ratio</span><span class="rpv">${dsRatio}</span></div>
-     <div class="rprow"><span class="rpk">Balance</span><span class="rpv" style="color:${balCol}">${bal>=0?'+':''}${bal.toFixed(2)} MMT</span></div>`;
+     <div class="rprow"><span class="rpk">Balance</span><span class="rpv" style="color:${balCol}">${bal>=0?'+':''}${bal.toFixed(2)} MMT</span></div>
+     <div id="rpinf-${name}">${flowsForRegion(name, sd)}</div>`;
   // Spark — supply history for this region
   const cvs = document.getElementById('rpinspark-'+name);
   if(cvs) {
